@@ -1,0 +1,4 @@
+# Task: Launch Trading Bot
+
+- [x] Verify access to `mt5_trading_ai` directory <!-- id: 0 -->
+- [x] Launch [live_trader.py](file:///C:/Users/Shadow/.gemini/antigravity/brain/e6a2f154-93fc-423b-970f-22d26231afc1/live_trader.py) from `.../brain/fe3cc05d...` <!-- id: 1 -->

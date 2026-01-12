@@ -1,0 +1,15 @@
+# Fix Model Loading and Feature Scaling in Live Trader
+
+## User Review Required
+None. This is a bug fix for runtime initialization.
+
+## Proposed Changes
+### Trading Bot
+#### [MODIFY] [live_trader.py](file:///C:/Users/Shadow/.gemini/antigravity/brain/e6a2f154-93fc-423b-970f-22d26231afc1/live_trader.py)
+- Update [load_model](file:///C:/Users/Shadow/.gemini/antigravity/brain/fe3cc05d-b1ed-4792-ae8d-494cf0e02a48/live_trader.py#26-33) to check if loaded object is a `dict`.
+- If `dict`, extract [model](file:///C:/Users/Shadow/.gemini/antigravity/brain/fe3cc05d-b1ed-4792-ae8d-494cf0e02a48/ai_trainer.py#387-391) and `scaler`.
+- Update [run](file:///C:/Users/Shadow/.gemini/antigravity/brain/fe3cc05d-b1ed-4792-ae8d-494cf0e02a48/live_trader.py#222-269) loop to apply `scaler.transform()` to features before passing to `model.predict()`.
+
+## Verification Plan
+### Automated Tests
+- Run `python live_trader.py` and verify it connects and enters the trading loop without crashing.

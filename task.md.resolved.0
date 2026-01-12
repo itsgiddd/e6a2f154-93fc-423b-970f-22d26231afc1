@@ -1,0 +1,4 @@
+# Task: Launch Trading Bot
+
+- [/] Verify access to `mt5_trading_ai` directory <!-- id: 0 -->
+- [ ] Launch `live_trader.py` <!-- id: 1 -->

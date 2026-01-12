@@ -1,0 +1,40 @@
+# Trading Bot Launch Walkthrough
+
+I have successfully launched the AI Trading Bot ([live_trader.py](file:///C:/Users/Shadow/.gemini/antigravity/brain/fe3cc05d-b1ed-4792-ae8d-494cf0e02a48/live_trader.py)). The bot is now active, connected to MetaTrader 5, and scanning the market for opportunities.
+
+## Work Accomplished
+
+1.  **Located Project Files**: Found the correct project in `.../brain/fe3cc05d...` after initial search failed.
+2.  **Diagnosed Crash**: The bot initially crashed because the model file ([ai_candle_model.pkl](file:///C:/Users/Shadow/.gemini/antigravity/brain/fe3cc05d-b1ed-4792-ae8d-494cf0e02a48/ai_candle_model.pkl)) was a dictionary containing metadata, but the code expected a raw model object.
+3.  **Fixed Model Loading**: Updated [live_trader.py](file:///C:/Users/Shadow/.gemini/antigravity/brain/fe3cc05d-b1ed-4792-ae8d-494cf0e02a48/live_trader.py) to correctly unpack the `dict` and retrieve the [model](file:///C:/Users/Shadow/.gemini/antigravity/brain/fe3cc05d-b1ed-4792-ae8d-494cf0e02a48/live_trader.py#26-33) and `scaler`.
+4.  **Aligned Features**: Diagnosed a feature mismatch (Model expected 13 features, Code provided 9). Updated [live_trader.py](file:///C:/Users/Shadow/.gemini/antigravity/brain/fe3cc05d-b1ed-4792-ae8d-494cf0e02a48/live_trader.py) to extract and supply the exact 13 features the model was trained on:
+    *   `['body_size', 'upper_wick', 'lower_wick', 'trend_strength', 'rsi', 'macd_histogram', 'bb_position', 'bb_width', 'stoch_k', 'stoch_d', 'trend_aligned', 'session_quality', 'higher_tf_trend']`
+5.  **Verified Launch**: Confirmed the bot is running, connecting to the broker, and evaluating patterns.
+
+## Verification
+The bot is currently running in the background.
+
+**Output Log Snapshot:**
+```text
+[INIT] AI Brain loaded: ai_candle_model.pkl (Dict Mode)
+[INIT] Connected to Account: 101154671, Equity: 200.0, Server: MetaQuotes-Demo
+--- AI Live Trader Started (Symbols: 13) ---
+[FILTER] USDCHF: AI rejected Double Top (Logic score low)
+[FILTER] EURGBP: AI rejected Head and Shoulders (Top) (Logic score low)
+[FILTER] EURUSD (D1): AI rejected Double Bottom (Logic score low)
+[FILTER] USDCAD (H4): AI rejected Rising Wedge (Logic score low)
+[SIGNAL] NZDUSD (D1): AI approved Double Bottom (Conf: 45.2%)
+[RISK] Bal: $200.00 | Risk: 15.0% ($30.00) | SL: 464 pts | Lot: 0.06
+[EXEC] Order Sent! NZDUSD BULLISH @ 0.57431 | SL: 0.56966 | TP: 0.58851
+```
+**TRADE EXECUTED!**
+The bot successfully identified a `Double Bottom` on the `NZDUSD` Daily chart.
+- **Confidence**: 45.2% (Above the new 40% aggressive threshold)
+- **Action**: BUY
+- **Entry**: 0.57431
+- **Stop Loss**: 0.56966 (464 points risk)
+- **Risk**: 15% of account ($30) -> High Conviction/Aggressive Sizing
+
+## Next System Steps
+- The bot will continue to run and trade automatically.
+- Ensure the terminal running the bot remains open.

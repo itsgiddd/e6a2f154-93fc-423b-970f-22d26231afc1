@@ -1,0 +1,5 @@
+{
+  "artifactType":  "ARTIFACT_TYPE_TASK",
+  "summary":  "Task list for launching the trading bot. Includes verifying directory access and running the launch script.",
+  "updatedAt":  "2026-01-11T23:47:28.736549200Z"
+}
