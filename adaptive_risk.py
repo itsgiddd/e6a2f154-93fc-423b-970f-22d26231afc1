@@ -11,12 +11,10 @@ class AdaptiveRiskManager:
     def calculate_lot_size(self, symbol: str, price: float, sl_price: float, confidence_score: int, account_info, symbol_info) -> float:
         balance = account_info.balance
         
-        # 1. Base Risk Percentage (The "Curve")
+        # 1. Base Risk Percentage (Conservative by default)
         risk_pct = 0.02 # Default 2%
-        if balance < 100: risk_pct = 0.20   # Degen Start
-        elif balance < 500: risk_pct = 0.15 # Accel
-        elif balance < 2000: risk_pct = 0.10 # Growth
-        elif balance < 10000: risk_pct = 0.05
+        if balance < 1000: risk_pct = 0.04
+        elif balance < 5000: risk_pct = 0.03
         
         # 2. Adjust for Confidence
         # Score 6/6 -> 100% of risk
