@@ -22,14 +22,56 @@ class AIBrain:
         self.risk_manager = AdaptiveRiskManager()
         self.memory = TradingMemory()
         self.reasoning_engine = ReasoningEngine()
+        self.required_columns = {"open", "high", "low", "close"}
+
+    def _sanitize_data(self, data: pd.DataFrame, name: str) -> pd.DataFrame:
+        if data is None or data.empty:
+            raise ValueError(f"{name} data is empty")
+        missing = self.required_columns - set(data.columns)
+        if missing:
+            raise ValueError(f"{name} data missing columns: {', '.join(sorted(missing))}")
+        cleaned = data.dropna(subset=list(self.required_columns)).copy()
+        if cleaned.empty:
+            raise ValueError(f"{name} data has no usable rows after cleanup")
+        if "time" in cleaned.columns:
+            cleaned = cleaned.sort_values("time")
+        return cleaned
+
+    def _validate_symbol_info(self, symbol_info) -> None:
+        required_attrs = ("point", "volume_step", "volume_min", "volume_max", "trade_tick_value")
+        missing = [attr for attr in required_attrs if not hasattr(symbol_info, attr)]
+        if missing:
+            raise ValueError(f"symbol_info missing fields: {', '.join(missing)}")
+
+    def _fallback_stop_loss(self, pattern, data_h1: pd.DataFrame, price: float) -> float:
+        lookback = data_h1.tail(20)
+        if pattern.direction == "bullish":
+            return float(lookback["low"].min())
+        return float(lookback["high"].max())
+
+    def _fallback_target_distance(self, data_h1: pd.DataFrame, risk: float) -> float:
+        lookback = data_h1.tail(20)
+        recent_range = float(lookback["high"].max() - lookback["low"].min())
+        return max(recent_range, risk * 2)
         
     def think(self, symbol: str, data_h1: pd.DataFrame, data_h4: pd.DataFrame, data_d1: pd.DataFrame, account_info, symbol_info) -> dict:
         """
         Returns a dict with decision and execution details.
         """
+        try:
+            data_h1 = self._sanitize_data(data_h1, "H1")
+            data_h4 = self._sanitize_data(data_h4, "H4")
+            data_d1 = self._sanitize_data(data_d1, "D1")
+            self._validate_symbol_info(symbol_info)
+        except ValueError as exc:
+            return {"decision": "REJECT", "reason": str(exc)}
+
         # 0. Check Memory (Revenge Trading / Kill Switch)
         if not self.memory.can_trade(symbol):
             return {"decision": "REJECT", "reason": "Memory Block (Loss Streak or Cooldown)"}
+
+        if len(data_h1) < 60 or len(data_h4) < 50 or len(data_d1) < 20:
+            return {"decision": "WAIT", "reason": "Insufficient market history"}
             
         # 1. Market Context
         market_state = self.market_analyzer.get_market_state(symbol, data_h1, data_h4, data_d1)
@@ -76,11 +118,20 @@ class AIBrain:
              
         # 4. Risk Calculation
         price = data_h1['close'].iloc[-1]
-        sl = best_pattern.details.get('stop_loss', price)
+        sl = best_pattern.details.get('stop_loss')
+        if sl is None:
+            sl = self._fallback_stop_loss(best_pattern, data_h1, price)
+        sl = float(sl)
         target_distance = best_pattern.details.get('height', 0)
 
+        risk = abs(price - sl)
+        if risk == 0:
+            return {"decision": "REJECT", "reason": "Zero risk distance", "reasoning": best_rationale + ["Rejected: zero risk distance"]}
+
         if target_distance <= 0:
-            return {"decision": "REJECT", "reason": "No measured move target", "reasoning": best_rationale + ["Rejected: missing measured move"]}
+            target_distance = self._fallback_target_distance(data_h1, risk)
+            if target_distance <= 0:
+                return {"decision": "REJECT", "reason": "No measured move target", "reasoning": best_rationale + ["Rejected: missing measured move"]}
 
         if best_pattern.direction == "bullish" and sl >= price:
             return {"decision": "REJECT", "reason": "Invalid SL for bullish setup", "reasoning": best_rationale + ["Rejected: SL above price"]}
@@ -88,10 +139,7 @@ class AIBrain:
             return {"decision": "REJECT", "reason": "Invalid SL for bearish setup", "reasoning": best_rationale + ["Rejected: SL below price"]}
 
         tp = price + target_distance if best_pattern.direction == "bullish" else price - target_distance
-        risk = abs(price - sl)
         reward = abs(tp - price)
-        if risk == 0:
-            return {"decision": "REJECT", "reason": "Zero risk distance", "reasoning": best_rationale + ["Rejected: zero risk distance"]}
         rr = reward / risk
         if rr < 2.0:
             return {"decision": "REJECT", "reason": f"RR below 1:2 ({rr:.2f})", "reasoning": best_rationale + [f"Rejected: RR {rr:.2f} < 2.0"]}
