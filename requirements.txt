@@ -1,52 +1,19 @@
-# Neural Forex Trading App - Python Dependencies
+# Neural Forex Trading App
 
-# Core Data Science and Machine Learning
+# Core
 numpy>=1.21.0
 pandas>=1.3.0
-scikit-learn>=1.0.0
 torch>=1.12.0
-torchvision>=0.13.0
+scikit-learn>=1.0.0
 
-# MetaTrader 5 Integration
+# MT5
 MetaTrader5>=5.0.45
 
-# Financial Data Analysis
-ta-lib>=0.4.24
-yfinance>=0.1.74
+# UI
+PySide6>=6.5.0
 
-# GUI and Application Framework
-tkinter-tooltip>=2.1.0
-pillow>=8.4.0
-
-# Configuration and Data Management
+# Config
 pyyaml>=6.0
-python-dotenv>=0.19.0
-jsonschema>=4.0.0
 
-# Logging and Monitoring
-loguru>=0.6.0
-coloredlogs>=15.0
-
-# Date and Time Handling
-pytz>=2021.3
-python-dateutil>=2.8.2
-
-# HTTP Requests and API
-requests>=2.26.0
-aiohttp>=3.8.0
-
-# Utilities
-tqdm>=4.62.0
-click>=8.0.0
-rich>=10.0.0
-
-# Testing and Quality Assurance
-pytest>=6.2.0
-pytest-cov>=3.0.0
-black>=21.9.0
-flake8>=4.0.0
-mypy>=0.910
-
-# Development Tools
-jupyter>=1.0.0
-ipython>=7.28.0
+# Indicators (optional — install manually if needed)
+# ta-lib>=0.4.24

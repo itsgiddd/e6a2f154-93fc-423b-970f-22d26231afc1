@@ -3,6 +3,14 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Old app versions (superseded by trading_app.py)
+neural-forex-trading-app/
+neural-forex-trading-app.zip
+production_main_app.py
+professional_dashboard.py
+main_app.py
+nul
+
 # C extensions
 *.so
 
