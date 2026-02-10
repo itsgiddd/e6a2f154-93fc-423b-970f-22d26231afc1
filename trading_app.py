@@ -1101,6 +1101,11 @@ class TradingApp(QMainWindow):
                             tp_dist = abs(tp1 - entry)
                             rr = tp_dist / sl_dist if sl_dist > 0 else 0
 
+                            # Hard filter: R:R must be >= 1.5 — never risk more than you gain
+                            if rr < 1.5:
+                                self._log(f"  {symbol}: SKIP R:R={rr:.2f} < 1.5")
+                                continue
+
                             # M15 confirmation
                             m15_conf = False
                             if df_m15 is not None:
@@ -1112,28 +1117,26 @@ class TradingApp(QMainWindow):
                                     elif direction == "SELL" and m15_pos == -1:
                                         m15_conf = True
 
-                            # Confidence scoring
-                            conf = 0.65
+                            # Quality score for ranking (higher = better trade)
+                            # R:R is king — a 3.0 R:R trade is worth way more than a 1.5
+                            score = 0.0
+                            score += min(rr, 5.0) * 20        # R:R contribution (max 100)
                             if is_fresh:
-                                conf += 0.15
+                                score += 30                    # Fresh flip is a strong signal
                             if m15_conf:
-                                conf += 0.10
-                            if rr >= 2.0:
-                                conf += 0.05
-                            elif rr >= 1.5:
-                                conf += 0.03
-                            # Age penalty for non-fresh
+                                score += 20                    # M15 alignment
+                            # Age penalty — stale signals lose points
                             if not is_fresh:
-                                age_penalty = min(bars_since * 0.03, 0.20)
-                                conf -= age_penalty
-                            conf = max(0.40, min(conf, 0.98))
+                                score -= min(bars_since * 1.0, 40)
+                            score = max(0, score)
+
                             tier = "S" if (is_fresh and m15_conf) else ("A" if m15_conf or is_fresh else "B")
 
                             sig = ZeroPointSignal(
                                 symbol=sym_resolved, direction=direction,
                                 entry_price=entry, stop_loss=sl,
                                 tp1=tp1, tp2=tp1, tp3=tp1,
-                                atr_value=atr_val, confidence=conf,
+                                atr_value=atr_val, confidence=score / 100.0,
                                 signal_time=datetime.now(), timeframe="H1",
                                 tier=tier, trailing_stop=trailing_stop,
                                 risk_reward=rr,
@@ -1143,20 +1146,27 @@ class TradingApp(QMainWindow):
                             fresh_tag = " FRESH" if is_fresh else f" age={bars_since}b"
                             self._log(
                                 f"  {symbol}: H1 {sig.direction} "
-                                f"R:R={rr:.2f} conf={conf:.0%} "
+                                f"R:R={rr:.2f} score={score:.0f} "
                                 f"tier={tier}{fresh_tag}{m15_tag}"
                             )
-                            signals.append((sig, sym_resolved))
+                            signals.append((sig, sym_resolved, score))
 
-                        # Place ALL valid signals
+                        # Rank by score, take top 3 only
+                        MAX_TRADES = 3
                         if signals:
-                            self._log(f"Placing {len(signals)} trade(s)...")
-                            for sig, sym_resolved in signals:
+                            signals.sort(key=lambda x: x[2], reverse=True)
+                            top = signals[:MAX_TRADES]
+                            skipped = signals[MAX_TRADES:]
+                            if skipped:
+                                skip_names = ", ".join(s[1] for s in skipped)
+                                self._log(f"  Skipping lower-ranked: {skip_names}")
+                            self._log(f"Placing top {len(top)} trade(s)...")
+                            for sig, sym_resolved, sc in top:
                                 lot = self._calc_lot_size(sig, sym_resolved, use_fixed, fixed_lot, risk_pct)
                                 if lot > 0:
                                     self._zp_place_trade(sig, sym_resolved, lot)
                         else:
-                            self._log("Scan: no H1 signals found")
+                            self._log("Scan: no qualifying signals (need R:R >= 1.5)")
 
                     except Exception as e:
                         self._log(f"Scan error: {e}")
