@@ -1116,11 +1116,6 @@ class TradingApp(QMainWindow):
                             tp_dist = abs(tp1 - entry)
                             rr = tp_dist / sl_dist if sl_dist > 0 else 0
 
-                            # Hard filter: R:R must be >= 1.0 — never risk more than you gain
-                            if rr < 1.0:
-                                self._log(f"  {symbol}: SKIP R:R={rr:.2f} < 1.0")
-                                continue
-
                             # H1 confirmation
                             h1_conf = False
                             if df_h1 is not None:
@@ -1224,7 +1219,7 @@ class TradingApp(QMainWindow):
                                 if lot > 0:
                                     self._zp_place_trade(sig, sym_resolved, lot)
                         else:
-                            self._log("Scan: no qualifying signals (need R:R >= 1.0)")
+                            self._log("Scan: no qualifying signals")
 
                     except Exception as e:
                         self._log(f"Scan error: {e}")
