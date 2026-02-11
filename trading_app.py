@@ -1121,14 +1121,41 @@ class TradingApp(QMainWindow):
                             bars_since = int(last.get("bars_since_flip", 999))
                             is_fresh = bars_since <= 3
 
-                            # SL from trailing stop with buffer
-                            sl = trailing_stop
-                            buffer = atr_val * SL_BUFFER_PCT
+                            # Smart Structure SL from Pine Script (pre-computed)
+                            # Use smart_sl from signal bar if available, else fallback
+                            sl = None
+                            if "smart_sl" in zp.columns:
+                                # Find most recent signal bar's smart_sl
+                                for sl_idx in range(len(zp) - 1, -1, -1):
+                                    sl_val = zp.iloc[sl_idx].get("smart_sl", float('nan'))
+                                    if not np.isnan(sl_val) and sl_val > 0:
+                                        sl = float(sl_val)
+                                        break
+
+                            if sl is None:
+                                # Fallback: trailing stop with buffer
+                                sl = trailing_stop
+                                buffer = atr_val * SL_BUFFER_PCT
+                                if direction == "BUY":
+                                    sl = sl - buffer
+                                else:
+                                    sl = sl + buffer
+
+                            # For non-fresh flips, tighten SL to trailing stop
+                            if not is_fresh and trailing_stop > 0:
+                                buffer = atr_val * SL_BUFFER_PCT
+                                if direction == "BUY":
+                                    ts_sl = trailing_stop - buffer
+                                    if ts_sl > sl:  # trailing stop is tighter
+                                        sl = ts_sl
+                                else:
+                                    ts_sl = trailing_stop + buffer
+                                    if ts_sl < sl:  # trailing stop is tighter
+                                        sl = ts_sl
+
                             if direction == "BUY":
-                                sl = sl - buffer
                                 tp1 = entry + atr_val * TP1_MULT
                             else:
-                                sl = sl + buffer
                                 tp1 = entry - atr_val * TP1_MULT
 
                             # Skip if no room to profit

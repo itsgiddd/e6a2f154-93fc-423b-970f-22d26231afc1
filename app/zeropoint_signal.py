@@ -69,15 +69,21 @@ def compute_zeropoint_state(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """
     Compute ZeroPoint ATR trailing stop state on any OHLCV DataFrame.
 
-    This is a standalone version of ZeroPointEngine._compute_signals() with
-    additional columns for neural feature extraction:
+    Matches the Pine Script ZeroPoint PRO indicator EXACTLY:
+      - ATR trailing stop with 4-branch position logic
+      - lastSignalDir filter to prevent duplicate signals in same direction
+      - Smart Structure SL using swing low/high with min ATR distance
+
+    Output columns:
       - atr: ATR(10)
       - xATRTrailingStop: trailing stop level
       - pos: +1 (bullish) or -1 (bearish)
-      - buy_signal / sell_signal: flip detection booleans
-      - bars_since_flip: bars since last signal flip (NEW)
-      - bars_in_position: bars within current trend direction (NEW)
-      - atr_median_100: rolling 100-bar median ATR for normalization (NEW)
+      - buy_signal / sell_signal: filtered signal (matches Pine buySignal/sellSignal)
+      - raw_flip_buy / raw_flip_sell: raw flips before lastSignalDir filter
+      - bars_since_flip: bars since last signal flip
+      - bars_in_position: bars within current trend direction
+      - atr_median_100: rolling 100-bar median ATR for normalization
+      - smart_sl: Smart Structure SL level (for BUY: below price, for SELL: above price)
 
     Args:
         df: OHLCV DataFrame with columns: open, high, low, close, volume
@@ -100,13 +106,19 @@ def compute_zeropoint_state(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         n_loss = ATR_MULTIPLIER * atr
 
         close = df["close"].values
+        high_arr = df["high"].values
+        low_arr = df["low"].values
         n = len(close)
         n_loss_arr = n_loss.values
+        atr_arr = atr.values
 
         stop = np.zeros(n, dtype=np.float64)
         pos = np.zeros(n, dtype=np.int32)
-        buy_sig = np.zeros(n, dtype=bool)
-        sell_sig = np.zeros(n, dtype=bool)
+        raw_flip_buy = np.zeros(n, dtype=bool)   # flippedToBuy (raw, before filter)
+        raw_flip_sell = np.zeros(n, dtype=bool)   # flippedToSell (raw, before filter)
+        buy_sig = np.zeros(n, dtype=bool)         # buySignal (filtered by lastSignalDir)
+        sell_sig = np.zeros(n, dtype=bool)        # sellSignal (filtered by lastSignalDir)
+        smart_sl = np.full(n, np.nan, dtype=np.float64)
 
         first_valid = ATR_PERIOD
         if first_valid >= n:
@@ -114,6 +126,9 @@ def compute_zeropoint_state(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 
         stop[first_valid] = close[first_valid]
         pos[first_valid] = 1
+
+        # Pine Script: var int lastSignalDir = 0
+        last_signal_dir = 0
 
         for i in range(first_valid + 1, n):
             nl = n_loss_arr[i]
@@ -126,6 +141,7 @@ def compute_zeropoint_state(df: pd.DataFrame) -> Optional[pd.DataFrame]:
             prev_c = close[i - 1]
             cur_c = close[i]
 
+            # Pine Script: 4-branch trailing stop logic (EXACT match)
             if cur_c > prev_stop and prev_c > prev_stop:
                 stop[i] = max(prev_stop, cur_c - nl)
                 pos[i] = 1
@@ -139,19 +155,74 @@ def compute_zeropoint_state(df: pd.DataFrame) -> Optional[pd.DataFrame]:
                 stop[i] = cur_c + nl
                 pos[i] = -1
 
-            if pos[i] == 1 and pos[i - 1] == -1:
-                buy_sig[i] = True
-            elif pos[i] == -1 and pos[i - 1] == 1:
-                sell_sig[i] = True
+            # Pine Script: flippedToBuy = currentlyBullish and not currentlyBullish[1]
+            flipped_to_buy = (pos[i] == 1 and pos[i - 1] != 1)
+            flipped_to_sell = (pos[i] == -1 and pos[i - 1] != -1)
+            raw_flip_buy[i] = flipped_to_buy
+            raw_flip_sell[i] = flipped_to_sell
+
+            # Pine Script: buySignal = flippedToBuy and lastSignalDir != 1
+            # Pine Script: sellSignal = flippedToSell and lastSignalDir != -1
+            is_buy_signal = flipped_to_buy and last_signal_dir != 1
+            is_sell_signal = flipped_to_sell and last_signal_dir != -1
+            buy_sig[i] = is_buy_signal
+            sell_sig[i] = is_sell_signal
+
+            # Pine Script: if buySignal -> lastSignalDir := 1
+            # Pine Script: if sellSignal -> lastSignalDir := -1
+            if is_buy_signal:
+                last_signal_dir = 1
+            if is_sell_signal:
+                last_signal_dir = -1
+
+            # ---------- Smart Structure SL (Pine Script exact) ----------
+            atr_val = atr_arr[i]
+            if np.isnan(atr_val) or atr_val <= 0:
+                continue
+
+            if is_buy_signal:
+                # Pine: recentSwingLow = ta.lowest(low, 10)
+                lookback_start = max(0, i - SWING_LOOKBACK + 1)
+                recent_swing_low = np.min(low_arr[lookback_start:i + 1])
+
+                # Pine: buffer = recentSwingLow * (input_slBuffer / 100)
+                buffer = recent_swing_low * SL_BUFFER_PCT
+                structural_sl = recent_swing_low - buffer
+                min_sl = cur_c - (atr_val * SL_ATR_MIN_MULT)
+
+                # Pine: if structuralSL > minSL -> slLevel := minSL else slLevel := structuralSL
+                if structural_sl > min_sl:
+                    smart_sl[i] = min_sl
+                else:
+                    smart_sl[i] = structural_sl
+
+            elif is_sell_signal:
+                # Pine: recentSwingHigh = ta.highest(high, 10)
+                lookback_start = max(0, i - SWING_LOOKBACK + 1)
+                recent_swing_high = np.max(high_arr[lookback_start:i + 1])
+
+                # Pine: buffer = recentSwingHigh * (input_slBuffer / 100)
+                buffer = recent_swing_high * SL_BUFFER_PCT
+                structural_sl = recent_swing_high + buffer
+                min_sl = cur_c + (atr_val * SL_ATR_MIN_MULT)
+
+                # Pine: if structuralSL < minSL -> slLevel := minSL else slLevel := structuralSL
+                if structural_sl < min_sl:
+                    smart_sl[i] = min_sl
+                else:
+                    smart_sl[i] = structural_sl
 
         # ---------- Base columns ----------
         df["atr"] = atr
         df["xATRTrailingStop"] = stop
         df["pos"] = pos
+        df["raw_flip_buy"] = raw_flip_buy
+        df["raw_flip_sell"] = raw_flip_sell
         df["buy_signal"] = buy_sig
         df["sell_signal"] = sell_sig
+        df["smart_sl"] = smart_sl
 
-        # ---------- NEW: bars_since_flip ----------
+        # ---------- bars_since_flip ----------
         # Count bars since the most recent buy_signal or sell_signal
         bars_since_flip = np.zeros(n, dtype=np.int32)
         last_flip = -1
@@ -161,7 +232,7 @@ def compute_zeropoint_state(df: pd.DataFrame) -> Optional[pd.DataFrame]:
             bars_since_flip[i] = (i - last_flip) if last_flip >= 0 else n
         df["bars_since_flip"] = bars_since_flip
 
-        # ---------- NEW: bars_in_position ----------
+        # ---------- bars_in_position ----------
         # Count consecutive bars in the same position direction
         bars_in_pos = np.zeros(n, dtype=np.int32)
         for i in range(first_valid, n):
@@ -171,7 +242,7 @@ def compute_zeropoint_state(df: pd.DataFrame) -> Optional[pd.DataFrame]:
                 bars_in_pos[i] = bars_in_pos[i - 1] + 1
         df["bars_in_position"] = bars_in_pos
 
-        # ---------- NEW: atr_median_100 ----------
+        # ---------- atr_median_100 ----------
         # Rolling 100-bar median ATR for normalization (robust to outliers)
         df["atr_median_100"] = atr.rolling(100, min_periods=20).median()
 
@@ -349,8 +420,19 @@ class ZeroPointEngine:
         entry_price = last_bar["close"]
         atr_val = last_bar["atr"]
 
-        # Smart Structure SL
-        sl = self._compute_smart_sl(df, last_idx, direction, atr_val)
+        # Smart Structure SL — use pre-computed smart_sl from signal bar
+        # Find the most recent signal bar's smart_sl
+        sl = None
+        if "smart_sl" in df.columns:
+            for idx in range(last_idx, -1, -1):
+                sl_val = df.iloc[idx].get("smart_sl", np.nan)
+                if not pd.isna(sl_val) and sl_val > 0:
+                    sl = float(sl_val)
+                    break
+
+        if sl is None:
+            # Fallback: compute Smart SL inline (same as Pine Script)
+            sl = self._compute_smart_sl(df, last_idx, direction, atr_val)
 
         # For ongoing positions, use the trailing stop as SL (tighter than flip SL)
         trailing_stop_val = float(last_bar.get("xATRTrailingStop", 0))
@@ -467,7 +549,12 @@ class ZeroPointEngine:
     # -----------------------------------------------------------------------
 
     def _compute_signals(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
-        """Compute ATR trailing stop, position, and signals on OHLCV data."""
+        """Compute ATR trailing stop, position, and signals on OHLCV data.
+
+        Matches Pine Script ZeroPoint PRO exactly:
+        - 4-branch trailing stop logic
+        - lastSignalDir filter to prevent duplicate signals in same direction
+        """
         try:
             df = df.copy()
 
@@ -482,13 +569,17 @@ class ZeroPointEngine:
             n_loss = ATR_MULTIPLIER * atr
 
             close = df["close"].values
+            high_arr = df["high"].values
+            low_arr = df["low"].values
             n = len(close)
             n_loss_arr = n_loss.values
+            atr_arr = atr.values
 
             stop = np.zeros(n, dtype=np.float64)
             pos = np.zeros(n, dtype=np.int32)
             buy_sig = np.zeros(n, dtype=bool)
             sell_sig = np.zeros(n, dtype=bool)
+            smart_sl = np.full(n, np.nan, dtype=np.float64)
 
             first_valid = ATR_PERIOD
             if first_valid >= n:
@@ -496,6 +587,9 @@ class ZeroPointEngine:
 
             stop[first_valid] = close[first_valid]
             pos[first_valid] = 1
+
+            # Pine Script: var int lastSignalDir = 0
+            last_signal_dir = 0
 
             for i in range(first_valid + 1, n):
                 nl = n_loss_arr[i]
@@ -521,16 +615,44 @@ class ZeroPointEngine:
                     stop[i] = cur_c + nl
                     pos[i] = -1
 
-                if pos[i] == 1 and pos[i - 1] == -1:
-                    buy_sig[i] = True
-                elif pos[i] == -1 and pos[i - 1] == 1:
-                    sell_sig[i] = True
+                # Pine Script: flippedToBuy/flippedToSell + lastSignalDir filter
+                flipped_to_buy = (pos[i] == 1 and pos[i - 1] != 1)
+                flipped_to_sell = (pos[i] == -1 and pos[i - 1] != -1)
+
+                is_buy_signal = flipped_to_buy and last_signal_dir != 1
+                is_sell_signal = flipped_to_sell and last_signal_dir != -1
+                buy_sig[i] = is_buy_signal
+                sell_sig[i] = is_sell_signal
+
+                if is_buy_signal:
+                    last_signal_dir = 1
+                if is_sell_signal:
+                    last_signal_dir = -1
+
+                # Smart Structure SL on signal bars
+                atr_val = atr_arr[i]
+                if not np.isnan(atr_val) and atr_val > 0:
+                    if is_buy_signal:
+                        lookback_start = max(0, i - SWING_LOOKBACK + 1)
+                        recent_swing_low = np.min(low_arr[lookback_start:i + 1])
+                        buffer = recent_swing_low * SL_BUFFER_PCT
+                        structural_sl = recent_swing_low - buffer
+                        min_sl = cur_c - (atr_val * SL_ATR_MIN_MULT)
+                        smart_sl[i] = min_sl if structural_sl > min_sl else structural_sl
+                    elif is_sell_signal:
+                        lookback_start = max(0, i - SWING_LOOKBACK + 1)
+                        recent_swing_high = np.max(high_arr[lookback_start:i + 1])
+                        buffer = recent_swing_high * SL_BUFFER_PCT
+                        structural_sl = recent_swing_high + buffer
+                        min_sl = cur_c + (atr_val * SL_ATR_MIN_MULT)
+                        smart_sl[i] = min_sl if structural_sl < min_sl else structural_sl
 
             df["atr"] = atr
             df["xATRTrailingStop"] = stop
             df["pos"] = pos
             df["buy_signal"] = buy_sig
             df["sell_signal"] = sell_sig
+            df["smart_sl"] = smart_sl
             return df
 
         except Exception as e:
