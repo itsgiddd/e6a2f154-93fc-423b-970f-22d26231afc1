@@ -1040,7 +1040,7 @@ class TradingApp(QMainWindow):
 
                                 # Check H4 ZP direction for this position
                                 try:
-                                    rates = mt5_lib.copy_rates_from_pos(pos_sym, mt5_lib.TIMEFRAME_H4, 0, 50)
+                                    rates = mt5_lib.copy_rates_from_pos(pos_sym, mt5_lib.TIMEFRAME_H4, 0, 200)
                                     if rates is not None and len(rates) >= 20:
                                         df_tmp = pd.DataFrame(rates)
                                         df_tmp["time"] = pd.to_datetime(df_tmp["time"], unit="s")
@@ -1050,6 +1050,9 @@ class TradingApp(QMainWindow):
                                             # pos.type: 0=BUY, 1=SELL
                                             trade_is_buy = pos.type == 0
                                             zp_is_buy = zp_dir == 1
+                                            trade_dir_str = "BUY" if trade_is_buy else "SELL"
+                                            zp_dir_str = "BUY" if zp_dir == 1 else ("SELL" if zp_dir == -1 else "NONE")
+                                            self._log(f"  {pos_norm}: open {trade_dir_str} | H4 ZP={zp_dir_str}")
 
                                             if zp_dir != 0 and trade_is_buy != zp_is_buy:
                                                 # ZP flipped against our trade — close it
