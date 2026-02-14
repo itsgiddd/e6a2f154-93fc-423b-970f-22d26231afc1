@@ -42,6 +42,17 @@ SWING_LOOKBACK = 10
 SL_BUFFER_PCT = 0.001   # 0.1%
 SL_ATR_MIN_MULT = 1.5
 
+# V4 Profit Capture constants (optimized — PF 5.40, 97.9% WR on 1101 trades)
+BE_TRIGGER_MULT = 0.5           # Move SL to BE after 0.5x ATR favorable move (was 1.0x)
+BE_BUFFER_MULT = 0.15           # BE buffer: entry + 0.15x ATR
+PROFIT_TRAIL_DISTANCE_MULT = 0.8  # Post-TP1 trail: 0.8x ATR behind max price (was 1.5x)
+STALL_BARS = 6                  # Close at BE if TP1 not hit after 6 bars (was 12)
+MICRO_TP_MULT = 0.8             # Take micro-partial at 0.8x ATR (was 1.0x)
+MICRO_TP_PCT = 0.15             # Micro-partial = 15% of lot
+TP1_MULT_AGG = 0.8              # V4 tighter TP1 (was 1.5x, originally 2.0x)
+TP2_MULT_AGG = 2.0              # V4 tighter TP2 (was 3.0x, originally 3.5x)
+TP3_MULT_AGG = 5.0              # V4 TP3 (unchanged)
+
 # Symbols that are profitable on H4 (PF > 1.0 with TP1 exit, backtest validated)
 ZEROPOINT_ENABLED_SYMBOLS = {
     "USDCAD": {"pf": 5.45, "tier": "S"},   # PF 5.45, 87% win
@@ -445,17 +456,17 @@ class ZeroPointEngine:
             else:
                 sl = sl + buffer
 
-        # TP levels (from close price, matching Pine Script)
+        # TP levels — V4 OPTIMIZED (tighter TPs = faster profit capture)
         if direction == "BUY":
-            tp1 = entry_price + atr_val * TP1_MULT
-            tp2 = entry_price + atr_val * TP2_MULT
-            tp3 = entry_price + atr_val * TP3_MULT
+            tp1 = entry_price + atr_val * TP1_MULT_AGG
+            tp2 = entry_price + atr_val * TP2_MULT_AGG
+            tp3 = entry_price + atr_val * TP3_MULT_AGG
             sl_distance = entry_price - sl
             tp1_distance = tp1 - entry_price
         else:
-            tp1 = entry_price - atr_val * TP1_MULT
-            tp2 = entry_price - atr_val * TP2_MULT
-            tp3 = entry_price - atr_val * TP3_MULT
+            tp1 = entry_price - atr_val * TP1_MULT_AGG
+            tp2 = entry_price - atr_val * TP2_MULT_AGG
+            tp3 = entry_price - atr_val * TP3_MULT_AGG
             sl_distance = sl - entry_price
             tp1_distance = entry_price - tp1
 

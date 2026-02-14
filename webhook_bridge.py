@@ -59,7 +59,7 @@ class EmailConfig:
 
 @dataclass
 class TradingConfig:
-    risk_pct: float = 0.08
+    risk_pct: float = 0.30
     default_lot: float = 0.40
     allowed_symbols: list = field(default_factory=lambda: [
         "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",
@@ -90,7 +90,7 @@ def load_config(path: str = None) -> tuple:
     )
 
     trading_cfg = TradingConfig(
-        risk_pct=cfg.get("trading", {}).get("risk_pct", 0.08),
+        risk_pct=cfg.get("trading", {}).get("risk_pct", 0.30),
         default_lot=cfg.get("trading", {}).get("default_lot", 0.40),
         allowed_symbols=cfg.get("trading", {}).get("allowed_symbols", [
             "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",
@@ -809,8 +809,8 @@ def _setup_wizard():
     print("-" * 60)
     print()
 
-    risk_input = input("  Risk per trade % (default 8): ").strip()
-    risk_pct = float(risk_input) / 100 if risk_input else 0.08
+    risk_input = input("  Risk per trade % (default 30): ").strip()
+    risk_pct = float(risk_input) / 100 if risk_input else 0.30
 
     symbols_input = input("  Symbols (comma-separated, or press Enter for all 8): ").strip()
     if symbols_input:

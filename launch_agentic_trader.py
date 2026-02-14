@@ -74,7 +74,7 @@ def main():
     engine = TradingEngine(
         mt5_connector=mt5,
         model_manager=model_mgr,
-        risk_per_trade=0.08,
+        risk_per_trade=0.30,
         confidence_threshold=0.65,
         trading_pairs=ALL_SYMBOLS,
         max_concurrent_positions=8,
