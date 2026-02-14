@@ -1169,13 +1169,104 @@ class TradingApp(QMainWindow):
                                 key = f"{grp}_{sig.direction}"
                                 corr_counts[key] = corr_counts.get(key, 0) + 1
 
-                        # Place signals with correlation-adjusted lots
+                        # Place signals with risk scoring + correlation adjustment
                         if signals:
                             self._log(f"Placing {len(signals)} trade(s)...")
                             for sig, sym_resolved in signals:
                                 lot = self._calc_lot_size(sig, sym_resolved, use_fixed, fixed_lot, risk_pct)
 
-                                # If 3+ correlated pairs in same direction, reduce lot by 30%
+                                # ── V4 Loser Risk Scoring ──
+                                # Score 0-5 warning flags. Each flag reduces lot size.
+                                # Based on DNA profiler: losers have weaker momentum, buy at
+                                # 20-bar extremes, enter during low ATR, BUY side, and Fridays.
+                                risk_flags = 0
+                                risk_reasons = []
+
+                                # Flag 1: BUY side (3.3% loss rate vs 1.5% SELL)
+                                if sig.direction == "BUY":
+                                    risk_flags += 1
+                                    risk_reasons.append("BUY-side")
+
+                                # Flag 2: Friday (4.1% loss rate vs 2.0% avg)
+                                import datetime as _dt_check
+                                if _dt_check.datetime.now().weekday() == 4:
+                                    risk_flags += 1
+                                    risk_reasons.append("Friday")
+
+                                # Flag 3: Price at 20-bar extreme (buying high / selling low)
+                                # Losers avg 0.78, winners avg 0.52 on 20-bar range
+                                try:
+                                    norm_sym = sym_resolved.upper().replace(".", "").replace("#", "").replace(".RAW", "")
+                                    rates_check = mt5_lib.copy_rates_from_pos(sym_resolved, mt5_lib.TIMEFRAME_H4, 0, 25)
+                                    if rates_check is not None and len(rates_check) >= 20:
+                                        highs_20 = [float(r[2]) for r in rates_check[-21:-1]]  # last 20 bars (exclude current)
+                                        lows_20 = [float(r[3]) for r in rates_check[-21:-1]]
+                                        h20 = max(highs_20)
+                                        l20 = min(lows_20)
+                                        rng = h20 - l20
+                                        if rng > 0:
+                                            price_pos = (sig.entry_price - l20) / rng
+                                            # BUY at top of range or SELL at bottom = exhaustion
+                                            if (sig.direction == "BUY" and price_pos > 0.85) or \
+                                               (sig.direction == "SELL" and price_pos < 0.15):
+                                                risk_flags += 1
+                                                risk_reasons.append(f"20bar-extreme({price_pos:.2f})")
+                                except Exception:
+                                    pass
+
+                                # Flag 4: ATR not expanding (losers: atr_vs_median=1.01, winners: 1.12)
+                                try:
+                                    if rates_check is not None and len(rates_check) >= 20:
+                                        # Quick ATR from last bar
+                                        cur_atr = getattr(sig, '_atr', None)
+                                        if cur_atr is None:
+                                            # Approximate from SL distance
+                                            cur_atr = abs(sig.entry_price - sig.stop_loss) / 3.0
+                                        # ATR 10 bars ago (rough)
+                                        closes = [float(r[4]) for r in rates_check[-12:]]
+                                        highs = [float(r[2]) for r in rates_check[-12:]]
+                                        lows = [float(r[3]) for r in rates_check[-12:]]
+                                        trs = []
+                                        for k in range(1, len(closes)):
+                                            tr = max(highs[k]-lows[k], abs(highs[k]-closes[k-1]), abs(lows[k]-closes[k-1]))
+                                            trs.append(tr)
+                                        if len(trs) >= 5:
+                                            recent_atr = sum(trs[-5:]) / 5
+                                            older_atr = sum(trs[:5]) / 5
+                                            if older_atr > 0 and recent_atr / older_atr < 0.95:
+                                                risk_flags += 1
+                                                risk_reasons.append(f"ATR-contracting({recent_atr/older_atr:.2f})")
+                                except Exception:
+                                    pass
+
+                                # Flag 5: Low 3-bar momentum (losers: 1.52 ATR, winners: 1.78 ATR)
+                                try:
+                                    if rates_check is not None and len(rates_check) >= 5:
+                                        close_now = float(rates_check[-1][4])
+                                        close_3ago = float(rates_check[-4][4])
+                                        est_atr = abs(sig.entry_price - sig.stop_loss) / 3.0
+                                        if est_atr > 0:
+                                            mom = abs(close_now - close_3ago) / est_atr
+                                            if mom < 1.2:  # well below loser average of 1.52
+                                                risk_flags += 1
+                                                risk_reasons.append(f"low-momentum({mom:.2f})")
+                                except Exception:
+                                    pass
+
+                                # Apply risk score: 0 flags = full lot, 3+ flags = 50% lot, 4+ = skip
+                                if risk_flags >= 4:
+                                    self._log(f"    {sym_resolved}: SKIP ({risk_flags} risk flags: {', '.join(risk_reasons)})")
+                                    continue
+                                elif risk_flags >= 3:
+                                    lot = round(lot * 0.50, 2)
+                                    self._log(f"    {sym_resolved}: x0.50 lot ({risk_flags} flags: {', '.join(risk_reasons)})")
+                                elif risk_flags >= 2:
+                                    lot = round(lot * 0.75, 2)
+                                    self._log(f"    {sym_resolved}: x0.75 lot ({risk_flags} flags: {', '.join(risk_reasons)})")
+                                elif risk_flags >= 1:
+                                    self._log(f"    {sym_resolved}: 1 flag ({', '.join(risk_reasons)}) — no adjustment")
+
+                                # Correlation filter — reduce lot if correlated pairs signal same direction
                                 norm = sym_resolved.upper().replace(".", "").replace("#", "").replace(".RAW", "")
                                 corr_reduction = 1.0
                                 for grp in _get_correlation_group(norm):
