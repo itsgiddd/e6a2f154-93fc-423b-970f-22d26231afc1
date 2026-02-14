@@ -1,6 +1,6 @@
-# ZeroPoint PRO — Velocity 4 (V4) Profit Capture System
+# Velocity 4 (V4) Profit Capture System
 
-Automated forex trading system that achieves a **97.5% win rate** (PF 5.05) across 1,101 trades over 166 weeks. Built on an ATR trailing stop indicator (ZeroPoint) combined with a 5-layer profit protection system — **Velocity 4** — named for how fast it compounds accounts: 7-10 doublings per year from a $200 start.
+Automated forex trading system that achieves a **97.5% win rate** (PF 5.05) across 1,101 trades over 166 weeks. Built on a ZeroPoint ATR trailing stop indicator combined with a 5-layer profit protection system — **Velocity 4** — named for how fast it compounds accounts: 7-10 doublings per year from a $200 start.
 
 Trades 8 currency pairs on the H4 timeframe via MetaTrader 5. Starts from as little as $200 with 1:500 leverage.
 
@@ -143,8 +143,8 @@ python trading_app.py
 ```
 
 1. Click **Connect MT5** (auto-detects your account)
-2. Click **Load Model** (loads the ZeroPoint neural model)
-3. Check **ZeroPoint Pure Mode**, set your lot size
+2. Click **Load Model** (loads the Velocity 4 neural model)
+3. Check **V4 Pure Mode**, set your lot size
 4. Click **Start**
 
 ### Training Models
