@@ -1,0 +1,660 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=6
+strategy("ZeroPoint PRO V4 Strategy", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=100, initial_capital=10000, commission_type=strategy.commission.percent, commission_value=0.0, slippage=0, process_orders_on_close=true, pyramiding=0, calc_on_every_tick=false)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// USER INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+grpCore = "Core ZeroPoint Settings"
+i_atrPeriod     = input.int(10,    "ATR Period",         minval=1,   group=grpCore)
+i_atrMult       = input.float(3.0, "ATR Multiplier",     minval=0.5, step=0.1, group=grpCore)
+i_swingLookback = input.int(10,    "Swing Lookback",     minval=3,   group=grpCore)
+i_slBufferPct   = input.float(0.1, "SL Buffer %",        minval=0.0, step=0.01, group=grpCore) // 0.1 = 0.1%
+i_slAtrMinMult  = input.float(1.5, "SL Min ATR Mult",    minval=0.5, step=0.1, group=grpCore)
+
+grpV4 = "V4 Profit Capture (Optimized)"
+i_tp1Mult       = input.float(0.8, "TP1 ATR Mult",       minval=0.1, step=0.1, group=grpV4)
+i_tp2Mult       = input.float(2.0, "TP2 ATR Mult",       minval=0.5, step=0.1, group=grpV4)
+i_tp3Mult       = input.float(5.0, "TP3 ATR Mult",       minval=1.0, step=0.5, group=grpV4)
+i_beTrigger     = input.float(0.5, "BE Trigger ATR",     minval=0.1, step=0.1, group=grpV4)
+i_beBuffer      = input.float(0.15,"BE Buffer ATR",      minval=0.0, step=0.05, group=grpV4)
+i_trailDist     = input.float(0.8, "Trail Dist ATR",     minval=0.1, step=0.1, group=grpV4)
+i_stallBars     = input.int(6,     "Stall Bars",         minval=2,   group=grpV4)
+i_microTpMult   = input.float(0.8, "Micro TP ATR",       minval=0.1, step=0.1, group=grpV4)
+i_microTpPct    = input.float(15,  "Micro TP %",         minval=1,   step=1, group=grpV4)  // displayed as %
+
+grpVisual = "Visual Settings"
+i_showTrail     = input.bool(true,  "Show ATR Trailing Stop",  group=grpVisual)
+i_showLevels    = input.bool(true,  "Show SL/TP Levels",       group=grpVisual)
+i_showLabels    = input.bool(true,  "Show Entry/Exit Labels",  group=grpVisual)
+i_showBE        = input.bool(true,  "Show BE Activation",      group=grpVisual)
+i_showFill      = input.bool(true,  "Fill SL/TP Zones",        group=grpVisual)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CORE ZP — ATR Trailing Stop (Wilder's RMA)
+// ═══════════════════════════════════════════════════════════════════════════
+
+atrVal = ta.atr(i_atrPeriod)
+nLoss  = atrVal * i_atrMult
+
+var float xATRTrailingStop = na
+var int   pos              = 0
+var int   lastSignalDir    = 0
+
+float prevStop  = nz(xATRTrailingStop[1], close)
+float prevClose = nz(close[1], close)
+
+// 4-branch trailing stop
+if close > prevStop and prevClose > prevStop
+    xATRTrailingStop := math.max(prevStop, close - nLoss)
+    pos := 1
+else if close < prevStop and prevClose < prevStop
+    xATRTrailingStop := math.min(prevStop, close + nLoss)
+    pos := -1
+else if close > prevStop
+    xATRTrailingStop := close - nLoss
+    pos := 1
+else
+    xATRTrailingStop := close + nLoss
+    pos := -1
+
+// Signal detection with lastSignalDir filter (no duplicate signals)
+bool flippedToBuy  = (pos == 1  and nz(pos[1], 0) != 1)
+bool flippedToSell = (pos == -1 and nz(pos[1], 0) != -1)
+
+bool buySignal  = flippedToBuy  and lastSignalDir != 1
+bool sellSignal = flippedToSell and lastSignalDir != -1
+
+if buySignal
+    lastSignalDir := 1
+if sellSignal
+    lastSignalDir := -1
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SMART STRUCTURE STOP LOSS
+// ═══════════════════════════════════════════════════════════════════════════
+
+float slLevel = na
+if buySignal
+    float recentSwingLow = ta.lowest(low, i_swingLookback)
+    float buf            = recentSwingLow * (i_slBufferPct / 100.0)
+    float structuralSL   = recentSwingLow - buf
+    float atrMinSL       = close - (atrVal * i_slAtrMinMult)
+    slLevel := structuralSL > atrMinSL ? atrMinSL : structuralSL
+else if sellSignal
+    float recentSwingHigh = ta.highest(high, i_swingLookback)
+    float buf             = recentSwingHigh * (i_slBufferPct / 100.0)
+    float structuralSL    = recentSwingHigh + buf
+    float atrMinSL        = close + (atrVal * i_slAtrMinMult)
+    slLevel := structuralSL < atrMinSL ? atrMinSL : structuralSL
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V4 TRADE MANAGEMENT STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════════════
+
+var int   tradeDir          = 0
+var float entryPrice        = na
+var float tradeATR          = na
+var float tradeSL           = na
+var float tp1Level          = na
+var float tp2Level          = na
+var float tp3Level          = na
+var bool  tp1Hit            = false
+var bool  tp2Hit            = false
+var bool  tp3Hit            = false
+var float maxFavorablePrice = na
+var float maxProfitReached  = 0.0
+var bool  beActivated       = false
+var bool  profitLockActive  = false
+var float profitLockSL      = na
+var bool  microTpHit        = false
+var bool  stallBeActivated  = false
+var int   barsInTrade       = 0
+var float remainingLot      = 1.0
+var float realizedPnlPct    = 0.0
+
+// Plotting state — persistent so lines stay visible
+var float plotSL  = na
+var float plotTP1 = na
+var float plotTP2 = na
+var float plotTP3 = na
+var float plotEntry = na
+var float plotTrailSL = na
+
+// Win/loss stats (real PnL-based)
+var int   wins              = 0
+var int   losses            = 0
+var float totalProfitPct    = 0.0
+var float totalLossPct      = 0.0
+var int   totalTrades       = 0
+var int   consecWins        = 0
+var int   consecLosses      = 0
+var int   maxConsecWins     = 0
+var int   maxConsecLosses   = 0
+
+// Exit event tracking (for labels)
+bool exitEvent    = false
+string exitType   = ""
+float exitPrice   = na
+bool entryEvent   = false
+string entryType  = ""
+bool beEvent      = false
+bool stallEvent   = false
+bool microEvent   = false
+bool tp1Event     = false
+bool tp2Event     = false
+bool tp3Event     = false
+bool trailEvent   = false
+
+bool tradeClosed = false
+
+float microFrac = i_microTpPct / 100.0
+
+// ─── Close existing trade on new opposing signal ─────────────────────────
+if (buySignal or sellSignal) and tradeDir != 0 and not tradeClosed
+    float closePnlPct = 0.0
+    if tradeDir == 1
+        closePnlPct := (close - entryPrice) / entryPrice * 100.0 * remainingLot
+    else
+        closePnlPct := (entryPrice - close) / entryPrice * 100.0 * remainingLot
+
+    float finalPnlPct = realizedPnlPct + closePnlPct
+    totalTrades := totalTrades + 1
+
+    if finalPnlPct > 0
+        wins := wins + 1
+        totalProfitPct := totalProfitPct + finalPnlPct
+        consecWins := consecWins + 1
+        consecLosses := 0
+        if consecWins > maxConsecWins
+            maxConsecWins := consecWins
+    else
+        losses := losses + 1
+        totalLossPct := totalLossPct + math.abs(finalPnlPct)
+        consecLosses := consecLosses + 1
+        consecWins := 0
+        if consecLosses > maxConsecLosses
+            maxConsecLosses := consecLosses
+
+    // Strategy close
+    if tradeDir == 1
+        strategy.close("Long", comment="ZP_FLIP")
+    else
+        strategy.close("Short", comment="ZP_FLIP")
+
+    exitEvent := true
+    exitType := "ZP_FLIP"
+    exitPrice := close
+    tradeDir := 0
+    tradeClosed := true
+
+    // Clear plot levels
+    plotSL := na
+    plotTP1 := na
+    plotTP2 := na
+    plotTP3 := na
+    plotEntry := na
+    plotTrailSL := na
+
+// ─── Open new trade on signal ────────────────────────────────────────────
+if buySignal and not na(slLevel)
+    tradeDir := 1
+    entryPrice := close
+    tradeATR := atrVal
+    tradeSL := slLevel
+    tp1Level := close + atrVal * i_tp1Mult
+    tp2Level := close + atrVal * i_tp2Mult
+    tp3Level := close + atrVal * i_tp3Mult
+    tp1Hit := false
+    tp2Hit := false
+    tp3Hit := false
+    maxFavorablePrice := close
+    maxProfitReached := 0.0
+    beActivated := false
+    profitLockActive := false
+    profitLockSL := na
+    microTpHit := false
+    stallBeActivated := false
+    barsInTrade := 0
+    remainingLot := 1.0
+    realizedPnlPct := 0.0
+    tradeClosed := false
+
+    // Strategy entry
+    strategy.entry("Long", strategy.long)
+
+    // Set plot levels
+    plotEntry := close
+    plotSL := slLevel
+    plotTP1 := tp1Level
+    plotTP2 := tp2Level
+    plotTP3 := tp3Level
+    plotTrailSL := na
+
+    entryEvent := true
+    entryType := "BUY"
+
+if sellSignal and not na(slLevel)
+    tradeDir := -1
+    entryPrice := close
+    tradeATR := atrVal
+    tradeSL := slLevel
+    tp1Level := close - atrVal * i_tp1Mult
+    tp2Level := close - atrVal * i_tp2Mult
+    tp3Level := close - atrVal * i_tp3Mult
+    tp1Hit := false
+    tp2Hit := false
+    tp3Hit := false
+    maxFavorablePrice := close
+    maxProfitReached := 0.0
+    beActivated := false
+    profitLockActive := false
+    profitLockSL := na
+    microTpHit := false
+    stallBeActivated := false
+    barsInTrade := 0
+    remainingLot := 1.0
+    realizedPnlPct := 0.0
+    tradeClosed := false
+
+    // Strategy entry
+    strategy.entry("Short", strategy.short)
+
+    // Set plot levels
+    plotEntry := close
+    plotSL := slLevel
+    plotTP1 := tp1Level
+    plotTP2 := tp2Level
+    plotTP3 := tp3Level
+    plotTrailSL := na
+
+    entryEvent := true
+    entryType := "SELL"
+
+// ─── V4 bar-by-bar management ────────────────────────────────────────────
+if tradeDir != 0 and not tradeClosed
+    barsInTrade := barsInTrade + 1
+    float tATR = nz(tradeATR, atrVal)
+    bool isBuy = tradeDir == 1
+
+    // Track max favorable excursion
+    if isBuy
+        if high > maxFavorablePrice
+            maxFavorablePrice := high
+        float curProfit = high - entryPrice
+        if curProfit > maxProfitReached
+            maxProfitReached := curProfit
+    else
+        if low < maxFavorablePrice
+            maxFavorablePrice := low
+        float curProfit = entryPrice - low
+        if curProfit > maxProfitReached
+            maxProfitReached := curProfit
+
+    // ── Post-TP1 trailing stop update ──
+    if tp1Hit
+        float trailD = i_trailDist * tATR
+        if isBuy
+            float newLock = maxFavorablePrice - trailD
+            if newLock > entryPrice and (na(profitLockSL) or newLock > profitLockSL)
+                profitLockSL := newLock
+                profitLockActive := true
+                trailEvent := true
+        else
+            float newLock = maxFavorablePrice + trailD
+            if newLock < entryPrice and (na(profitLockSL) or newLock < profitLockSL)
+                profitLockSL := newLock
+                profitLockActive := true
+                trailEvent := true
+
+    // ── Early breakeven at BE_TRIGGER * ATR ──
+    if not beActivated
+        if maxProfitReached >= i_beTrigger * tATR
+            float beBuffer = i_beBuffer * tATR
+            if isBuy
+                float newSL = entryPrice + beBuffer
+                if newSL > tradeSL
+                    tradeSL := newSL
+                    beActivated := true
+                    beEvent := true
+            else
+                float newSL = entryPrice - beBuffer
+                if newSL < tradeSL
+                    tradeSL := newSL
+                    beActivated := true
+                    beEvent := true
+
+    // ── Stall exit: move to BE if no TP1 after N bars ──
+    if not tp1Hit and not stallBeActivated
+        if barsInTrade >= i_stallBars
+            float beBuffer = i_beBuffer * tATR
+            if isBuy
+                float newSL = entryPrice + beBuffer
+                if newSL > tradeSL
+                    tradeSL := newSL
+                    stallBeActivated := true
+                    beActivated := true
+                    stallEvent := true
+            else
+                float newSL = entryPrice - beBuffer
+                if newSL < tradeSL
+                    tradeSL := newSL
+                    stallBeActivated := true
+                    beActivated := true
+                    stallEvent := true
+
+    // ── Micro-partial at MICRO_TP * ATR ──
+    if not microTpHit and not tp1Hit
+        float microPrice = isBuy ? (entryPrice + i_microTpMult * tATR) : (entryPrice - i_microTpMult * tATR)
+        bool microTriggered = isBuy ? (high >= microPrice) : (low <= microPrice)
+        if microTriggered
+            microTpHit := true
+            float microPnlPct = 0.0
+            if isBuy
+                microPnlPct := (microPrice - entryPrice) / entryPrice * 100.0 * microFrac
+            else
+                microPnlPct := (entryPrice - microPrice) / entryPrice * 100.0 * microFrac
+            realizedPnlPct := realizedPnlPct + microPnlPct
+            remainingLot := remainingLot - microFrac
+            microEvent := true
+
+    // ── TP1 ──
+    if not tp1Hit and remainingLot > 0
+        bool tp1Triggered = isBuy ? (high >= tp1Level) : (low <= tp1Level)
+        if tp1Triggered
+            tp1Hit := true
+            float partialFrac = 0.333
+            if partialFrac > remainingLot
+                partialFrac := remainingLot
+            float tp1PnlPct = 0.0
+            if isBuy
+                tp1PnlPct := (tp1Level - entryPrice) / entryPrice * 100.0 * partialFrac
+            else
+                tp1PnlPct := (entryPrice - tp1Level) / entryPrice * 100.0 * partialFrac
+            realizedPnlPct := realizedPnlPct + tp1PnlPct
+            remainingLot := remainingLot - partialFrac
+            tp1Event := true
+
+    // ── TP2 ──
+    if tp1Hit and not tp2Hit and remainingLot > 0
+        bool tp2Triggered = isBuy ? (high >= tp2Level) : (low <= tp2Level)
+        if tp2Triggered
+            tp2Hit := true
+            tradeSL := entryPrice
+            beActivated := true
+            float partialFrac = 0.333
+            if partialFrac > remainingLot
+                partialFrac := remainingLot
+            float tp2PnlPct = 0.0
+            if isBuy
+                tp2PnlPct := (tp2Level - entryPrice) / entryPrice * 100.0 * partialFrac
+            else
+                tp2PnlPct := (entryPrice - tp2Level) / entryPrice * 100.0 * partialFrac
+            realizedPnlPct := realizedPnlPct + tp2PnlPct
+            remainingLot := remainingLot - partialFrac
+            tp2Event := true
+
+    // ── TP3 ──
+    if tp2Hit and not tp3Hit and remainingLot > 0
+        bool tp3Triggered = isBuy ? (high >= tp3Level) : (low <= tp3Level)
+        if tp3Triggered
+            tp3Hit := true
+            float tp3PnlPct = 0.0
+            if isBuy
+                tp3PnlPct := (tp3Level - entryPrice) / entryPrice * 100.0 * remainingLot
+            else
+                tp3PnlPct := (entryPrice - tp3Level) / entryPrice * 100.0 * remainingLot
+            realizedPnlPct := realizedPnlPct + tp3PnlPct
+            remainingLot := 0.0
+
+            totalTrades := totalTrades + 1
+            if realizedPnlPct > 0
+                wins := wins + 1
+                totalProfitPct := totalProfitPct + realizedPnlPct
+                consecWins := consecWins + 1
+                consecLosses := 0
+                if consecWins > maxConsecWins
+                    maxConsecWins := consecWins
+            else
+                losses := losses + 1
+                totalLossPct := totalLossPct + math.abs(realizedPnlPct)
+                consecLosses := consecLosses + 1
+                consecWins := 0
+                if consecLosses > maxConsecLosses
+                    maxConsecLosses := consecLosses
+
+            if tradeDir == 1
+                strategy.close("Long", comment="TP3")
+            else
+                strategy.close("Short", comment="TP3")
+
+            exitEvent := true
+            exitType := "TP3"
+            exitPrice := isBuy ? tp3Level : tp3Level
+            tradeDir := 0
+            tradeClosed := true
+            tp3Event := true
+
+            plotSL := na
+            plotTP1 := na
+            plotTP2 := na
+            plotTP3 := na
+            plotEntry := na
+            plotTrailSL := na
+
+    // ── Post-TP1 profit lock SL hit ──
+    if not tradeClosed and profitLockActive and not na(profitLockSL) and remainingLot > 0
+        bool lockHit = isBuy ? (low <= profitLockSL) : (high >= profitLockSL)
+        if lockHit
+            float lockPnlPct = 0.0
+            if isBuy
+                lockPnlPct := (profitLockSL - entryPrice) / entryPrice * 100.0 * remainingLot
+            else
+                lockPnlPct := (entryPrice - profitLockSL) / entryPrice * 100.0 * remainingLot
+            float finalPnlPct = realizedPnlPct + lockPnlPct
+            totalTrades := totalTrades + 1
+            if finalPnlPct > 0
+                wins := wins + 1
+                totalProfitPct := totalProfitPct + finalPnlPct
+                consecWins := consecWins + 1
+                consecLosses := 0
+                if consecWins > maxConsecWins
+                    maxConsecWins := consecWins
+            else
+                losses := losses + 1
+                totalLossPct := totalLossPct + math.abs(finalPnlPct)
+                consecLosses := consecLosses + 1
+                consecWins := 0
+                if consecLosses > maxConsecLosses
+                    maxConsecLosses := consecLosses
+
+            if tradeDir == 1
+                strategy.close("Long", comment="TRAIL_SL")
+            else
+                strategy.close("Short", comment="TRAIL_SL")
+
+            exitEvent := true
+            exitType := "PROFIT_LOCK"
+            exitPrice := profitLockSL
+            tradeDir := 0
+            tradeClosed := true
+
+            plotSL := na
+            plotTP1 := na
+            plotTP2 := na
+            plotTP3 := na
+            plotEntry := na
+            plotTrailSL := na
+
+    // ── SL hit ──
+    if not tradeClosed and remainingLot > 0
+        bool slHit = isBuy ? (low <= tradeSL) : (high >= tradeSL)
+        if slHit
+            float slPnlPct = 0.0
+            if isBuy
+                slPnlPct := (tradeSL - entryPrice) / entryPrice * 100.0 * remainingLot
+            else
+                slPnlPct := (entryPrice - tradeSL) / entryPrice * 100.0 * remainingLot
+            float finalPnlPct = realizedPnlPct + slPnlPct
+            totalTrades := totalTrades + 1
+            if finalPnlPct > 0
+                wins := wins + 1
+                totalProfitPct := totalProfitPct + finalPnlPct
+                consecWins := consecWins + 1
+                consecLosses := 0
+                if consecWins > maxConsecWins
+                    maxConsecWins := consecWins
+            else
+                losses := losses + 1
+                totalLossPct := totalLossPct + math.abs(finalPnlPct)
+                consecLosses := consecLosses + 1
+                consecWins := 0
+                if consecLosses > maxConsecLosses
+                    maxConsecLosses := consecLosses
+
+            string slComment = beActivated ? (stallBeActivated ? "SL_STALL" : "SL_BE") : "SL"
+            if tradeDir == 1
+                strategy.close("Long", comment=slComment)
+            else
+                strategy.close("Short", comment=slComment)
+
+            exitEvent := true
+            exitType := slComment
+            exitPrice := tradeSL
+            tradeDir := 0
+            tradeClosed := true
+
+            plotSL := na
+            plotTP1 := na
+            plotTP2 := na
+            plotTP3 := na
+            plotEntry := na
+            plotTrailSL := na
+
+// ─── Update plot levels for active trade ─────────────────────────────────
+if tradeDir != 0 and not tradeClosed
+    plotSL := tradeSL
+    plotTP1 := tp1Hit ? na : tp1Level
+    plotTP2 := tp2Hit ? na : tp2Level
+    plotTP3 := tp3Hit ? na : tp3Level
+    plotEntry := entryPrice
+    plotTrailSL := profitLockActive ? profitLockSL : na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISUAL PLOTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ATR Trailing Stop line (the core ZeroPoint line)
+color zpColor = pos == 1 ? color.new(#00E676, 0) : color.new(#FF1744, 0)
+plot(i_showTrail ? xATRTrailingStop : na, "ZP Trail Stop", color=zpColor, linewidth=2, style=plot.style_linebr)
+
+// Entry price (dashed reference)
+plot(i_showLevels and tradeDir != 0 ? plotEntry : na, "Entry", color=color.new(color.white, 30), linewidth=1, style=plot.style_linebr)
+
+// Stop loss (red)
+p_sl = plot(i_showLevels and tradeDir != 0 ? plotSL : na, "Stop Loss", color=color.new(#FF1744, 20), linewidth=2, style=plot.style_linebr)
+
+// Profit lock trailing SL (orange)
+plot(i_showLevels and tradeDir != 0 and profitLockActive ? plotTrailSL : na, "Trail SL", color=color.new(#FF9800, 0), linewidth=2, style=plot.style_linebr)
+
+// TP1 (cyan)
+p_tp1 = plot(i_showLevels and tradeDir != 0 ? plotTP1 : na, "TP1", color=color.new(#00BCD4, 20), linewidth=1, style=plot.style_linebr)
+
+// TP2 (blue)
+p_tp2 = plot(i_showLevels and tradeDir != 0 ? plotTP2 : na, "TP2", color=color.new(#2196F3, 30), linewidth=1, style=plot.style_linebr)
+
+// TP3 (purple)
+p_tp3 = plot(i_showLevels and tradeDir != 0 ? plotTP3 : na, "TP3", color=color.new(#9C27B0, 40), linewidth=1, style=plot.style_linebr)
+
+// Entry reference line for fills
+p_entry = plot(i_showFill and tradeDir != 0 ? plotEntry : na, "Entry Fill", color=color.new(color.white, 100), display=display.none)
+
+// Zone fills (SL zone = red tint, TP zone = green tint)
+fill(p_entry, p_sl,  color=i_showFill and tradeDir != 0 ? color.new(#FF1744, 90) : na, title="SL Zone")
+fill(p_entry, p_tp1, color=i_showFill and tradeDir != 0 ? color.new(#00E676, 93) : na, title="TP1 Zone")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENTRY / EXIT LABELS
+// ═══════════════════════════════════════════════════════════════════════════
+
+if i_showLabels and entryEvent
+    if entryType == "BUY"
+        label.new(bar_index, low, "BUY", style=label.style_label_up, color=color.new(#00E676, 10), textcolor=color.white, size=size.small)
+    else
+        label.new(bar_index, high, "SELL", style=label.style_label_down, color=color.new(#FF1744, 10), textcolor=color.white, size=size.small)
+
+if i_showLabels and exitEvent
+    color exitColor = str.contains(exitType, "SL") ? color.new(#FF1744, 10) : exitType == "ZP_FLIP" ? color.new(#FF9800, 10) : color.new(#00E676, 10)
+    if tradeDir == 0  // trade just closed
+        label.new(bar_index, high, exitType, style=label.style_label_down, color=exitColor, textcolor=color.white, size=size.tiny)
+
+// ── V4 event labels ──
+if i_showBE and beEvent and not stallEvent
+    label.new(bar_index, tradeDir == 1 ? low : high, "BE", style=tradeDir == 1 ? label.style_label_up : label.style_label_down, color=color.new(#FFC107, 20), textcolor=color.black, size=size.tiny)
+
+if i_showBE and stallEvent
+    label.new(bar_index, tradeDir == 1 ? low : high, "STALL", style=tradeDir == 1 ? label.style_label_up : label.style_label_down, color=color.new(#FF9800, 20), textcolor=color.white, size=size.tiny)
+
+if i_showLabels and microEvent
+    label.new(bar_index, tradeDir == 1 ? high : low, "u-TP", style=tradeDir == 1 ? label.style_label_down : label.style_label_up, color=color.new(#00BCD4, 30), textcolor=color.white, size=size.tiny)
+
+if i_showLabels and tp1Event
+    label.new(bar_index, tradeDir == 1 ? high : low, "TP1", style=tradeDir == 1 ? label.style_label_down : label.style_label_up, color=color.new(#00BCD4, 10), textcolor=color.white, size=size.tiny)
+
+if i_showLabels and tp2Event
+    label.new(bar_index, tradeDir == 1 ? high : low, "TP2", style=tradeDir == 1 ? label.style_label_down : label.style_label_up, color=color.new(#2196F3, 10), textcolor=color.white, size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BACKGROUND COLOR — Active trade direction
+// ═══════════════════════════════════════════════════════════════════════════
+
+bgcolor(tradeDir == 1 ? color.new(#00E676, 95) : tradeDir == -1 ? color.new(#FF1744, 95) : na, title="Trade Direction BG")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATS TABLE (top-right corner)
+// ═══════════════════════════════════════════════════════════════════════════
+
+var table statsTable = table.new(position.top_right, 2, 10, border_width=1)
+
+if barstate.islast
+    float winRate = totalTrades > 0 ? (wins * 100.0 / totalTrades) : 0.0
+    float profitFactor = totalLossPct > 0 ? (totalProfitPct / totalLossPct) : 0.0
+
+    color headerBg = color.new(#1a1a2e, 0)
+    color rowBg    = color.new(#16213e, 0)
+    color txtColor = color.white
+
+    table.cell(statsTable, 0, 0, "ZeroPoint V4", bgcolor=headerBg, text_color=#00E676, text_size=size.small)
+    table.cell(statsTable, 1, 0, "STATS",        bgcolor=headerBg, text_color=#00E676, text_size=size.small)
+
+    table.cell(statsTable, 0, 1, "Win Rate",     bgcolor=rowBg, text_color=txtColor, text_size=size.tiny)
+    table.cell(statsTable, 1, 1, str.tostring(winRate, "#.#") + "%", bgcolor=rowBg, text_color=winRate >= 80 ? #00E676 : winRate >= 60 ? #FFC107 : #FF1744, text_size=size.tiny)
+
+    table.cell(statsTable, 0, 2, "Profit Factor", bgcolor=rowBg, text_color=txtColor, text_size=size.tiny)
+    table.cell(statsTable, 1, 2, str.tostring(profitFactor, "#.##"), bgcolor=rowBg, text_color=profitFactor >= 2.0 ? #00E676 : profitFactor >= 1.0 ? #FFC107 : #FF1744, text_size=size.tiny)
+
+    table.cell(statsTable, 0, 3, "Total Trades", bgcolor=rowBg, text_color=txtColor, text_size=size.tiny)
+    table.cell(statsTable, 1, 3, str.tostring(totalTrades), bgcolor=rowBg, text_color=txtColor, text_size=size.tiny)
+
+    table.cell(statsTable, 0, 4, "Wins",         bgcolor=rowBg, text_color=txtColor, text_size=size.tiny)
+    table.cell(statsTable, 1, 4, str.tostring(wins), bgcolor=rowBg, text_color=#00E676, text_size=size.tiny)
+
+    table.cell(statsTable, 0, 5, "Losses",       bgcolor=rowBg, text_color=txtColor, text_size=size.tiny)
+    table.cell(statsTable, 1, 5, str.tostring(losses), bgcolor=rowBg, text_color=#FF1744, text_size=size.tiny)
+
+    table.cell(statsTable, 0, 6, "Max Consec W", bgcolor=rowBg, text_color=txtColor, text_size=size.tiny)
+    table.cell(statsTable, 1, 6, str.tostring(maxConsecWins), bgcolor=rowBg, text_color=#00E676, text_size=size.tiny)
+
+    table.cell(statsTable, 0, 7, "Max Consec L", bgcolor=rowBg, text_color=txtColor, text_size=size.tiny)
+    table.cell(statsTable, 1, 7, str.tostring(maxConsecLosses), bgcolor=rowBg, text_color=#FF1744, text_size=size.tiny)
+
+    table.cell(statsTable, 0, 8, "In Trade",     bgcolor=rowBg, text_color=txtColor, text_size=size.tiny)
+    string tradeStatus = tradeDir == 1 ? "LONG" : tradeDir == -1 ? "SHORT" : "FLAT"
+    color  statusColor = tradeDir == 1 ? #00E676 : tradeDir == -1 ? #FF1744 : color.gray
+    table.cell(statsTable, 1, 8, tradeStatus, bgcolor=rowBg, text_color=statusColor, text_size=size.tiny)
+
+    table.cell(statsTable, 0, 9, "Remaining",    bgcolor=rowBg, text_color=txtColor, text_size=size.tiny)
+    table.cell(statsTable, 1, 9, tradeDir != 0 ? str.tostring(remainingLot * 100, "#") + "%" : "-", bgcolor=rowBg, text_color=txtColor, text_size=size.tiny)

@@ -981,7 +981,7 @@ class TradingApp(QMainWindow):
                 s = json.load(f)
             self.chk_fixed_lots.setChecked(s.get('fixed_lots', True))
             self.inp_lot.setText(s.get('lot_size', '0.40'))
-            self.inp_risk.setText(s.get('risk_pct', '8'))
+            self.inp_risk.setText(s.get('risk_pct', '30'))
             self.inp_conf.setText(s.get('min_conf', '65'))
             self.inp_maxloss.setText(s.get('max_loss', '80'))
             self.inp_be.setText(s.get('be_pips', '15'))
@@ -1025,7 +1025,7 @@ class TradingApp(QMainWindow):
 
             use_fixed = self.chk_fixed_lots.isChecked()
             lot = self._float(self.inp_lot, 0.40)
-            risk_pct = self._float(self.inp_risk, 8) / 100.0
+            risk_pct = self._float(self.inp_risk, 30) / 100.0
             min_conf = self._float(self.inp_conf, 65) / 100.0
             mode_str = f"Fixed {lot}" if use_fixed else f"Adaptive {risk_pct:.0%} risk"
             self._log(f"ZP Scanner started | {mode_str} | Min conf: {min_conf:.0%} | Scanning every 60s")
@@ -1037,13 +1037,55 @@ class TradingApp(QMainWindow):
 
                 zp_engine = ZeroPointEngine()
 
+                # V4 Adaptive risk state
+                _consec_wins = 0
+                _consec_losses = 0
+                _last_trade_count = 0
+
                 while getattr(self, '_zp_running', False):
                     try:
                         selected = [p for p, c in self.pair_checks.items() if c.isChecked()]
                         use_fixed = self.chk_fixed_lots.isChecked()
                         fixed_lot = self._float(self.inp_lot, 0.40)
-                        risk_pct = self._float(self.inp_risk, 8) / 100.0
+                        base_risk_pct = self._float(self.inp_risk, 30) / 100.0
                         min_conf = self._float(self.inp_conf, 65) / 100.0
+
+                        # V4 Adaptive risk: scale risk based on recent performance
+                        # Base: 30% (aggressive for 97.5% WR system — double every ~18 days)
+                        # After 3+ consec wins: bump risk 25% (30% -> 37.5%)
+                        # After a loss: reduce risk 37.5% for next 2 trades (30% -> 18.75%)
+                        # After account grows past $50K: cap risk at 20%
+                        risk_pct = base_risk_pct
+                        try:
+                            acct_info = mt5_lib.account_info()
+                            if acct_info and acct_info.balance > 50000:
+                                risk_pct = min(risk_pct, 0.20)  # Cap at 20% above $50K
+
+                            # Track consecutive W/L from deal history
+                            import datetime as _dt
+                            from_date = _dt.datetime.now() - _dt.timedelta(days=30)
+                            deals = mt5_lib.history_deals_get(from_date, _dt.datetime.now())
+                            if deals:
+                                # Count recent consecutive results (last 10 closed trades)
+                                recent_pnls = [d.profit for d in deals if d.profit != 0 and d.magic == 123456][-10:]
+                                _consec_wins = 0
+                                _consec_losses = 0
+                                for p in reversed(recent_pnls):
+                                    if p > 0:
+                                        _consec_wins += 1
+                                        if _consec_losses > 0:
+                                            break
+                                    else:
+                                        _consec_losses += 1
+                                        if _consec_wins > 0:
+                                            break
+
+                                if _consec_wins >= 3:
+                                    risk_pct = min(risk_pct * 1.25, 0.40)  # Max 40%
+                                elif _consec_losses >= 1:
+                                    risk_pct = risk_pct * 0.625  # 30% -> 18.75%
+                        except Exception:
+                            pass  # Keep base risk on error
 
                         # Track which symbols already have open positions
                         open_positions = mt5_lib.positions_get()
@@ -1104,11 +1146,46 @@ class TradingApp(QMainWindow):
                             )
                             signals.append((sig, sym_resolved))
 
-                        # Place ALL valid signals
+                        # V4: Correlation filter — reduce lot if correlated pairs signal same direction
+                        # USD pairs: EURUSD, GBPUSD, AUDUSD, NZDUSD, USDCAD, USDJPY
+                        # JPY pairs: EURJPY, GBPJPY, USDJPY
+                        USD_PAIRS = {"EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDCAD", "USDJPY"}
+                        JPY_PAIRS = {"EURJPY", "GBPJPY", "USDJPY"}
+
+                        def _get_correlation_group(sym_name):
+                            norm = sym_name.upper().replace(".", "").replace("#", "").replace(".RAW", "")
+                            groups = []
+                            if norm in USD_PAIRS:
+                                groups.append("USD")
+                            if norm in JPY_PAIRS:
+                                groups.append("JPY")
+                            return groups
+
+                        # Count signals per correlation group + direction
+                        corr_counts = {}  # e.g. {"USD_BUY": 3, "JPY_SELL": 1}
+                        for sig, sym_r in signals:
+                            norm = sym_r.upper().replace(".", "").replace("#", "").replace(".RAW", "")
+                            for grp in _get_correlation_group(norm):
+                                key = f"{grp}_{sig.direction}"
+                                corr_counts[key] = corr_counts.get(key, 0) + 1
+
+                        # Place signals with correlation-adjusted lots
                         if signals:
                             self._log(f"Placing {len(signals)} trade(s)...")
                             for sig, sym_resolved in signals:
                                 lot = self._calc_lot_size(sig, sym_resolved, use_fixed, fixed_lot, risk_pct)
+
+                                # If 3+ correlated pairs in same direction, reduce lot by 30%
+                                norm = sym_resolved.upper().replace(".", "").replace("#", "").replace(".RAW", "")
+                                corr_reduction = 1.0
+                                for grp in _get_correlation_group(norm):
+                                    key = f"{grp}_{sig.direction}"
+                                    if corr_counts.get(key, 0) >= 3:
+                                        corr_reduction = 0.7
+                                        self._log(f"    {sym_resolved}: corr filter x0.7 ({corr_counts[key]} {grp} {sig.direction})")
+                                        break
+                                lot = round(lot * corr_reduction, 2)
+
                                 if lot > 0:
                                     self._zp_place_trade(sig, sym_resolved, lot)
                         else:
@@ -1128,10 +1205,24 @@ class TradingApp(QMainWindow):
         except Exception as e:
             self._log(f"Start error: {e}")
 
+    # Tier-based lot multipliers: higher PF symbols get bigger positions
+    TIER_LOT_MULTIPLIER = {
+        "S": 1.5,   # USDCAD (PF 5.45) — 50% bigger
+        "A": 1.2,   # GBPJPY, USDJPY — 20% bigger
+        "B": 1.0,   # AUDUSD, EURJPY, NZDUSD — standard
+        "C": 0.6,   # GBPUSD (PF 1.0) — 40% smaller
+    }
+
     def _calc_lot_size(self, sig, symbol, use_fixed, fixed_lot, risk_pct):
-        """Calculate lot size — fixed or adaptive (risk-based)."""
+        """Calculate lot size — risk-based with V4 tier scaling.
+
+        Tier S (PF 5.45) gets 1.5x lot, Tier C (PF 1.0) gets 0.6x.
+        """
         if use_fixed:
-            return fixed_lot
+            # Even fixed lots get tier-scaled
+            tier = getattr(sig, 'tier', 'B')
+            tier_mult = self.TIER_LOT_MULTIPLIER.get(tier, 1.0)
+            return round(fixed_lot * tier_mult, 2)
         try:
             import MetaTrader5 as mt5_lib
             sym_info = mt5_lib.symbol_info(symbol)
@@ -1159,11 +1250,21 @@ class TradingApp(QMainWindow):
                 return fixed_lot
 
             lot = risk_amount / loss_per_lot
+
+            # V4 Tier scaling — higher PF symbols get bigger lots
+            tier = getattr(sig, 'tier', 'B')
+            tier_mult = self.TIER_LOT_MULTIPLIER.get(tier, 1.0)
+            lot *= tier_mult
+
             vol_step = sym_info.volume_step
             lot = round(lot / vol_step) * vol_step
             lot = max(sym_info.volume_min, min(lot, sym_info.volume_max))
 
-            self._log(f"    {symbol} adaptive lot={lot:.2f} (risk ${risk_amount:.0f}, loss/lot ${loss_per_lot:.0f})")
+            self._log(
+                f"    {symbol} adaptive lot={lot:.2f} "
+                f"(risk ${risk_amount:.0f}, loss/lot ${loss_per_lot:.0f}, "
+                f"tier={tier} x{tier_mult})"
+            )
             return lot
         except Exception as e:
             self._log(f"    Lot calc error: {e}, using fixed={fixed_lot}")
@@ -1188,7 +1289,9 @@ class TradingApp(QMainWindow):
 
             digits = sym_info.digits
             sl = round(sig.stop_loss, digits)
-            tp = round(sig.tp1, digits)
+            # V4: Set broker TP to TP3 (5.0x ATR) — V4 manages partials at TP1/TP2 internally
+            # If we set TP to TP1, broker auto-closes before our partial system runs
+            tp = round(sig.tp3, digits)
 
             request = {
                 "action": mt5_lib.TRADE_ACTION_DEAL,

@@ -96,7 +96,7 @@ class TradingEngine:
     """Professional neural trading engine"""
     
     def __init__(self, mt5_connector: MT5Connector, model_manager: NeuralModelManager,
-                 risk_per_trade: float = 0.08, confidence_threshold: float = 0.65,
+                 risk_per_trade: float = 0.30, confidence_threshold: float = 0.65,
                  trading_pairs: List[str] = None, max_concurrent_positions: int = 8):
         
         self.logger = logging.getLogger(__name__)
@@ -116,7 +116,7 @@ class TradingEngine:
         self.performance_tracker = AdvancedPerformanceTracker()
         
         # Trading parameters
-        self.risk_per_trade = risk_per_trade  # 8% aggressive growth mode
+        self.risk_per_trade = risk_per_trade  # 30% aggressive for 97.5% WR — double every ~18 days
         self.confidence_threshold = confidence_threshold  # 65% default
         self.trading_pairs = trading_pairs or ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'BTCUSD']
         self.max_concurrent_positions = max_concurrent_positions
@@ -238,16 +238,27 @@ class TradingEngine:
 
         # ZeroPoint Trade Monitor settings
         self.zp_max_loss_dollars = 80.0   # Close if losing more than this dollar amount
-        self.zp_breakeven_pips = 15.0     # Move SL to entry when in profit by this many pips
-        # ZP trailing stop is automatic — re-reads H4 ATR stop each cycle
 
-        # Profit protection timer — log warnings only, don't auto-close
-        # User controls exits via TP editing in the app
-        self.zp_profit_protect_enabled = False
-        self.zp_stall_minutes = 30        # Start watching after this many minutes
-        self.zp_close_deadline_minutes = 60  # Force close by this time if still stalling/fading
-        self.zp_profit_fade_pct = 0.40    # Close if lost 40% of peak profit
-        # Per-position tracking: ticket -> {peak_pnl, peak_time, stall_start}
+        # V4 Profit Capture — imported from zeropoint_signal.py constants
+        from app.zeropoint_signal import (
+            BE_TRIGGER_MULT, BE_BUFFER_MULT, PROFIT_TRAIL_DISTANCE_MULT,
+            STALL_BARS, MICRO_TP_MULT, MICRO_TP_PCT,
+            TP1_MULT_AGG, TP2_MULT_AGG, TP3_MULT_AGG,
+        )
+        self.v4_be_trigger = BE_TRIGGER_MULT       # 0.5x ATR -> move SL to BE
+        self.v4_be_buffer = BE_BUFFER_MULT          # 0.15x ATR buffer above entry
+        self.v4_trail_dist = PROFIT_TRAIL_DISTANCE_MULT  # 0.8x ATR behind max price
+        self.v4_stall_bars = STALL_BARS             # 6 H4 bars -> move to BE
+        self.v4_micro_mult = MICRO_TP_MULT          # 0.8x ATR micro-partial trigger
+        self.v4_micro_pct = MICRO_TP_PCT            # 15% of lot
+        self.v4_tp1_mult = TP1_MULT_AGG             # 0.8x ATR
+        self.v4_tp2_mult = TP2_MULT_AGG             # 2.0x ATR
+        self.v4_tp3_mult = TP3_MULT_AGG             # 5.0x ATR
+
+        # Per-position V4 state tracker:
+        # ticket -> {entry, atr, direction, open_time, open_bar_idx,
+        #            be_activated, stall_activated, micro_hit, tp1_hit, tp2_hit,
+        #            max_favorable_price, profit_lock_sl, remaining_lot, original_lot}
         self._zp_position_tracker: Dict[int, Dict[str, Any]] = {}
 
         self.logger.info("ACI Trading Engine initialized (ZeroPoint PRO enabled)")
@@ -3011,7 +3022,16 @@ class TradingEngine:
                 self.logger.debug(f"ZP manage error {pos.symbol}: {e}")
 
     def _zp_manage_single_position(self, mt5_pos):
-        """Manage a single open position with ZP trailing stop + safety cutoffs."""
+        """V4 Profit Capture — full 5-layer trade management.
+
+        Layers:
+        1. Early BE: Move SL to BE after 0.5x ATR favorable move
+        2. Stall Exit: Move to BE after 6 H4 bars if TP1 not hit
+        3. Micro-Partial: Close 15% of lot at 0.8x ATR profit
+        4. TP1/TP2 Partials: Close 1/3 at TP1 (0.8x), 1/3 at TP2 (2.0x)
+        5. Post-TP1 Trail: Trail SL 0.8x ATR behind max favorable price
+        Plus: ZP flip exit, max loss cutoff
+        """
         import MetaTrader5 as mt5_lib
 
         symbol = mt5_pos.symbol
@@ -3024,178 +3044,272 @@ class TradingEngine:
         pnl = mt5_pos.profit
         volume = mt5_pos.volume
 
-        # --- 1. MAX LOSS CUTOFF ---
-        if pnl <= -self.zp_max_loss_dollars:
-            self.logger.warning(
-                f"ZP MAX LOSS cutoff: {symbol} {action} losing ${abs(pnl):.2f} "
-                f"(threshold ${self.zp_max_loss_dollars:.2f}) — CLOSING"
-            )
-            self._mt5_close_position(ticket, symbol, action, volume)
-            self._zp_position_tracker.pop(ticket, None)
-            return
-
-        # --- 2. PROFIT PROTECTION TIMER ---
-        # Track peak P/L per position. If the trade was profitable but is now
-        # stalling or fading, close within 30-60 min to lock in gains.
-        now = datetime.now()
-        tracker = self._zp_position_tracker.get(ticket)
-        if tracker is None:
-            tracker = {
-                "peak_pnl": pnl,
-                "peak_time": now,
-                "stall_start": None,
-                "open_time": now,
-            }
-            self._zp_position_tracker[ticket] = tracker
-
-        # Update peak P/L
-        if pnl > tracker["peak_pnl"]:
-            tracker["peak_pnl"] = pnl
-            tracker["peak_time"] = now
-            tracker["stall_start"] = None  # Reset stall timer — still making new highs
-
-        if self.zp_profit_protect_enabled and tracker["peak_pnl"] > 0:
-            peak = tracker["peak_pnl"]
-            age_minutes = (now - tracker["open_time"]).total_seconds() / 60.0
-
-            # How much of the peak profit has been given back?
-            if peak > 0:
-                fade_ratio = 1.0 - (pnl / peak)  # 0 = at peak, 1 = all profit gone
-            else:
-                fade_ratio = 0.0
-
-            # Start stall clock once trade age exceeds stall_minutes
-            if age_minutes >= self.zp_stall_minutes:
-                if tracker["stall_start"] is None:
-                    tracker["stall_start"] = now
-                    self.logger.info(
-                        f"ZP PROFIT WATCH: {symbol} {action} age={age_minutes:.0f}min "
-                        f"peak=${peak:.2f} current=${pnl:.2f} fade={fade_ratio:.0%}"
-                    )
-
-                stall_elapsed = (now - tracker["stall_start"]).total_seconds() / 60.0
-
-                # Close conditions:
-                # A) Lost significant chunk of peak profit (40%+) — take what's left
-                # B) Deadline reached (60 min) and trade is below peak — lock it in
-                # C) Trade went from profitable to breakeven/losing — exit now
-                should_close = False
-                close_reason = ""
-
-                if pnl <= 0 and peak >= 2.0:
-                    # Was profitable, now losing — exit immediately
-                    should_close = True
-                    close_reason = f"profit-to-loss (peak=${peak:.2f} now=${pnl:.2f})"
-                elif fade_ratio >= self.zp_profit_fade_pct and pnl > 0:
-                    # Lost 40%+ of peak but still profitable — take remaining profit
-                    should_close = True
-                    close_reason = (
-                        f"profit-fade {fade_ratio:.0%} "
-                        f"(peak=${peak:.2f} now=${pnl:.2f})"
-                    )
-                elif age_minutes >= self.zp_close_deadline_minutes and pnl > 0 and pnl < peak * 0.80:
-                    # 60 min deadline and not near peak — close to lock in
-                    should_close = True
-                    close_reason = (
-                        f"stall-deadline {age_minutes:.0f}min "
-                        f"(peak=${peak:.2f} now=${pnl:.2f})"
-                    )
-
-                if should_close:
-                    self.logger.warning(
-                        f"ZP PROFIT PROTECT: {symbol} {action} — {close_reason} — CLOSING"
-                    )
-                    self._mt5_close_position(ticket, symbol, action, volume)
-                    self._zp_position_tracker.pop(ticket, None)
-                    return
-
-        # --- 3. BREAK-EVEN MOVE ---
-        # Once in profit by zp_breakeven_pips, move SL to entry + 1 pip buffer
         sym_info = mt5_lib.symbol_info(symbol)
         if sym_info is None:
             return
         point = sym_info.point
         digits = sym_info.digits
 
-        profit_pips = 0.0
-        if action == "BUY":
-            profit_pips = (current_price - entry) / (point * 10)
+        # --- 0. MAX LOSS CUTOFF ---
+        if pnl <= -self.zp_max_loss_dollars:
+            self.logger.warning(
+                f"V4 MAX LOSS: {symbol} {action} losing ${abs(pnl):.2f} — CLOSING"
+            )
+            self._mt5_close_position(ticket, symbol, action, volume)
+            self._zp_position_tracker.pop(ticket, None)
+            return
+
+        # --- Initialize V4 tracker for new positions ---
+        now = datetime.now()
+        tracker = self._zp_position_tracker.get(ticket)
+        if tracker is None:
+            # Get ATR at entry from live H4 data
+            atr_at_entry = 0.0
+            try:
+                h4_rates = self.mt5_connector.get_rates(symbol, mt5.TIMEFRAME_H4, 0, 200)
+                if h4_rates:
+                    df_h4 = self._prepare_ohlc_dataframe(h4_rates)
+                    if df_h4 is not None and len(df_h4) >= 15:
+                        zp_state = compute_zeropoint_state(df_h4)
+                        if zp_state is not None and len(zp_state) > 0:
+                            atr_at_entry = float(zp_state.iloc[-1].get("atr", 0))
+            except Exception:
+                pass
+
+            if atr_at_entry <= 0:
+                # Fallback: estimate ATR from SL distance
+                atr_at_entry = abs(entry - current_sl) / 3.0 if current_sl > 0 else 0.001
+
+            tracker = {
+                "entry": entry,
+                "atr": atr_at_entry,
+                "direction": action,
+                "open_time": now,
+                "h4_bars_at_open": 0,
+                "be_activated": False,
+                "stall_activated": False,
+                "micro_hit": False,
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "max_favorable_price": entry,
+                "profit_lock_sl": None,
+                "remaining_lot": volume,
+                "original_lot": volume,
+            }
+            self._zp_position_tracker[ticket] = tracker
+
+        atr = tracker["atr"]
+        is_buy = (action == "BUY")
+
+        # --- Track max favorable excursion ---
+        if is_buy:
+            if current_price > tracker["max_favorable_price"]:
+                tracker["max_favorable_price"] = current_price
+            max_profit_raw = tracker["max_favorable_price"] - entry
         else:
-            profit_pips = (entry - current_price) / (point * 10)
+            if current_price < tracker["max_favorable_price"]:
+                tracker["max_favorable_price"] = current_price
+            max_profit_raw = entry - tracker["max_favorable_price"]
 
-        be_sl = None
-        if profit_pips >= self.zp_breakeven_pips:
-            # Move SL to entry + 1 pip buffer in our favor
-            buffer = point * 10  # 1 pip
-            if action == "BUY":
-                be_sl = round(entry + buffer, digits)
-                # Only move if current SL is below break-even
-                if current_sl >= be_sl:
-                    be_sl = None
-            else:
-                be_sl = round(entry - buffer, digits)
-                if current_sl != 0 and current_sl <= be_sl:
-                    be_sl = None
-
-        # --- 3. ZP TRAILING STOP ---
-        # Re-compute ZeroPoint ATR trailing stop from live H4 data
-        # and tighten SL if it's moved in our favor
-        trail_sl = None
+        # --- Count H4 bars elapsed ---
+        h4_bars_elapsed = 0
         try:
             h4_rates = self.mt5_connector.get_rates(symbol, mt5.TIMEFRAME_H4, 0, 200)
             if h4_rates:
                 df_h4 = self._prepare_ohlc_dataframe(h4_rates)
-                if df_h4 is not None and len(df_h4) >= 15:
+                if df_h4 is not None and len(df_h4) > 0:
+                    # Count bars since entry time
+                    import pandas as pd
+                    entry_time = tracker["open_time"]
+                    bars_after = df_h4[df_h4["time"] > entry_time]
+                    h4_bars_elapsed = len(bars_after)
+
+                    # Also get live ZP state for flip detection
                     zp_state = compute_zeropoint_state(df_h4)
-                    if zp_state is not None and len(zp_state) > 0:
-                        zp_stop = float(zp_state.iloc[-1].get("xATRTrailingStop", 0))
-                        zp_pos = int(zp_state.iloc[-1].get("pos", 0))
-                        if zp_stop > 0:
-                            # Only trail if ZP direction still matches our trade
-                            if action == "BUY" and zp_pos == 1:
-                                new_sl = round(zp_stop, digits)
-                                # Only tighten (move SL up for BUY)
-                                if new_sl > current_sl:
-                                    trail_sl = new_sl
-                            elif action == "SELL" and zp_pos == -1:
-                                new_sl = round(zp_stop, digits)
-                                # Only tighten (move SL down for SELL)
-                                if current_sl == 0 or new_sl < current_sl:
-                                    trail_sl = new_sl
+        except Exception:
+            zp_state = None
 
-                            # ZP flipped against us — close trade (Pine Script: close on signal switch)
-                            if (action == "BUY" and zp_pos == -1) or \
-                               (action == "SELL" and zp_pos == 1):
-                                self.logger.warning(
-                                    f"ZP FLIP EXIT: {symbol} {action} — ZP flipped against us, CLOSING"
-                                )
-                                self._mt5_close_position(ticket, symbol, action, volume)
-                                self._zp_position_tracker.pop(ticket, None)
-                                return
-        except Exception as e:
-            self.logger.debug(f"ZP trail error {symbol}: {e}")
+        # --- 1. ZP FLIP EXIT (highest priority) ---
+        try:
+            if zp_state is not None and len(zp_state) > 0:
+                zp_pos = int(zp_state.iloc[-1].get("pos", 0))
+                if (is_buy and zp_pos == -1) or (not is_buy and zp_pos == 1):
+                    self.logger.warning(
+                        f"V4 ZP_FLIP: {symbol} {action} — ZP flipped against us, CLOSING"
+                    )
+                    self._mt5_close_position(ticket, symbol, action, tracker["remaining_lot"])
+                    self._zp_position_tracker.pop(ticket, None)
+                    return
+        except Exception:
+            pass
 
-        # --- Apply the best new SL (whichever is tighter) ---
         new_sl = current_sl
-        if be_sl is not None:
-            if action == "BUY":
-                new_sl = max(new_sl, be_sl)
-            else:
-                new_sl = min(new_sl, be_sl) if new_sl != 0 else be_sl
-        if trail_sl is not None:
-            if action == "BUY":
-                new_sl = max(new_sl, trail_sl)
-            else:
-                new_sl = min(new_sl, trail_sl) if new_sl != 0 else trail_sl
+        new_tp = current_tp
+        reason_parts = []
 
-        # Only send modify if SL actually changed
+        # --- 2. EARLY BREAKEVEN (0.5x ATR favorable move) ---
+        if not tracker["be_activated"] and atr > 0:
+            if max_profit_raw >= self.v4_be_trigger * atr:
+                be_buffer = self.v4_be_buffer * atr
+                if is_buy:
+                    be_level = round(entry + be_buffer, digits)
+                    if be_level > new_sl:
+                        new_sl = be_level
+                        tracker["be_activated"] = True
+                        reason_parts.append("V4-BE")
+                        self.logger.info(
+                            f"V4 BE ACTIVATED: {symbol} {action} "
+                            f"max_profit={max_profit_raw/atr:.2f}x ATR -> SL to {be_level}"
+                        )
+                else:
+                    be_level = round(entry - be_buffer, digits)
+                    if new_sl == 0 or be_level < new_sl:
+                        new_sl = be_level
+                        tracker["be_activated"] = True
+                        reason_parts.append("V4-BE")
+                        self.logger.info(
+                            f"V4 BE ACTIVATED: {symbol} {action} "
+                            f"max_profit={max_profit_raw/atr:.2f}x ATR -> SL to {be_level}"
+                        )
+
+        # --- 3. STALL EXIT (6 H4 bars, no TP1 -> move to BE) ---
+        if not tracker["tp1_hit"] and not tracker["stall_activated"] and atr > 0:
+            if h4_bars_elapsed >= self.v4_stall_bars:
+                be_buffer = self.v4_be_buffer * atr
+                if is_buy:
+                    stall_sl = round(entry + be_buffer, digits)
+                    if stall_sl > new_sl:
+                        new_sl = stall_sl
+                        tracker["stall_activated"] = True
+                        tracker["be_activated"] = True
+                        reason_parts.append("V4-STALL")
+                        self.logger.info(
+                            f"V4 STALL EXIT: {symbol} {action} "
+                            f"{h4_bars_elapsed} bars, no TP1 -> SL to BE {stall_sl}"
+                        )
+                else:
+                    stall_sl = round(entry - be_buffer, digits)
+                    if new_sl == 0 or stall_sl < new_sl:
+                        new_sl = stall_sl
+                        tracker["stall_activated"] = True
+                        tracker["be_activated"] = True
+                        reason_parts.append("V4-STALL")
+                        self.logger.info(
+                            f"V4 STALL EXIT: {symbol} {action} "
+                            f"{h4_bars_elapsed} bars, no TP1 -> SL to BE {stall_sl}"
+                        )
+
+        # --- 4. MICRO-PARTIAL (15% at 0.8x ATR) ---
+        if not tracker["micro_hit"] and not tracker["tp1_hit"] and atr > 0:
+            micro_price = entry + self.v4_micro_mult * atr if is_buy else entry - self.v4_micro_mult * atr
+            micro_triggered = (current_price >= micro_price) if is_buy else (current_price <= micro_price)
+
+            if micro_triggered and tracker["remaining_lot"] > sym_info.volume_min:
+                micro_lot = round(tracker["original_lot"] * self.v4_micro_pct, 2)
+                micro_lot = max(sym_info.volume_min, micro_lot)
+                # Snap to volume_step
+                vol_step = sym_info.volume_step
+                micro_lot = round(micro_lot / vol_step) * vol_step
+                micro_lot = min(micro_lot, tracker["remaining_lot"] - sym_info.volume_min)
+
+                if micro_lot >= sym_info.volume_min:
+                    self.logger.info(
+                        f"V4 MICRO-TP: {symbol} {action} closing {micro_lot:.2f} lots "
+                        f"(15% at {self.v4_micro_mult}x ATR)"
+                    )
+                    self._mt5_close_partial(ticket, symbol, action, micro_lot, "V4-micro-TP")
+                    tracker["remaining_lot"] = round(tracker["remaining_lot"] - micro_lot, 2)
+                    tracker["micro_hit"] = True
+
+        # --- 5. TP1 PARTIAL (33% at 0.8x ATR) ---
+        if not tracker["tp1_hit"] and atr > 0:
+            tp1_price = entry + self.v4_tp1_mult * atr if is_buy else entry - self.v4_tp1_mult * atr
+            tp1_triggered = (current_price >= tp1_price) if is_buy else (current_price <= tp1_price)
+
+            if tp1_triggered and tracker["remaining_lot"] > sym_info.volume_min:
+                tp1_lot = round(tracker["original_lot"] * 0.333, 2)
+                tp1_lot = max(sym_info.volume_min, tp1_lot)
+                vol_step = sym_info.volume_step
+                tp1_lot = round(tp1_lot / vol_step) * vol_step
+                tp1_lot = min(tp1_lot, tracker["remaining_lot"] - sym_info.volume_min)
+
+                if tp1_lot >= sym_info.volume_min:
+                    self.logger.info(
+                        f"V4 TP1 HIT: {symbol} {action} closing {tp1_lot:.2f} lots "
+                        f"(33% at {self.v4_tp1_mult}x ATR = {tp1_price:.{digits}f})"
+                    )
+                    self._mt5_close_partial(ticket, symbol, action, tp1_lot, "V4-TP1")
+                    tracker["remaining_lot"] = round(tracker["remaining_lot"] - tp1_lot, 2)
+                    tracker["tp1_hit"] = True
+
+        # --- 6. TP2 PARTIAL (33% at 2.0x ATR) ---
+        if tracker["tp1_hit"] and not tracker["tp2_hit"] and atr > 0:
+            tp2_price = entry + self.v4_tp2_mult * atr if is_buy else entry - self.v4_tp2_mult * atr
+            tp2_triggered = (current_price >= tp2_price) if is_buy else (current_price <= tp2_price)
+
+            if tp2_triggered and tracker["remaining_lot"] > sym_info.volume_min:
+                tp2_lot = round(tracker["original_lot"] * 0.333, 2)
+                tp2_lot = max(sym_info.volume_min, tp2_lot)
+                vol_step = sym_info.volume_step
+                tp2_lot = round(tp2_lot / vol_step) * vol_step
+                tp2_lot = min(tp2_lot, tracker["remaining_lot"] - sym_info.volume_min)
+
+                if tp2_lot >= sym_info.volume_min:
+                    self.logger.info(
+                        f"V4 TP2 HIT: {symbol} {action} closing {tp2_lot:.2f} lots "
+                        f"(33% at {self.v4_tp2_mult}x ATR = {tp2_price:.{digits}f})"
+                    )
+                    self._mt5_close_partial(ticket, symbol, action, tp2_lot, "V4-TP2")
+                    tracker["remaining_lot"] = round(tracker["remaining_lot"] - tp2_lot, 2)
+                    tracker["tp2_hit"] = True
+                    # Also move SL to BE on TP2
+                    if is_buy:
+                        if entry > new_sl:
+                            new_sl = round(entry, digits)
+                            reason_parts.append("V4-TP2-BE")
+                    else:
+                        if new_sl == 0 or entry < new_sl:
+                            new_sl = round(entry, digits)
+                            reason_parts.append("V4-TP2-BE")
+
+        # --- 7. POST-TP1 TRAILING STOP (0.8x ATR behind max favorable price) ---
+        if tracker["tp1_hit"] and atr > 0:
+            trail_dist = self.v4_trail_dist * atr
+            if is_buy:
+                lock_sl = round(tracker["max_favorable_price"] - trail_dist, digits)
+                if lock_sl > entry and lock_sl > new_sl:
+                    new_sl = lock_sl
+                    tracker["profit_lock_sl"] = lock_sl
+                    reason_parts.append("V4-TRAIL")
+            else:
+                lock_sl = round(tracker["max_favorable_price"] + trail_dist, digits)
+                if lock_sl < entry and (new_sl == 0 or lock_sl < new_sl):
+                    new_sl = lock_sl
+                    tracker["profit_lock_sl"] = lock_sl
+                    reason_parts.append("V4-TRAIL")
+
+        # --- 8. ZP ATR TRAILING STOP (original — tighten SL from indicator) ---
+        try:
+            if zp_state is not None and len(zp_state) > 0:
+                zp_stop = float(zp_state.iloc[-1].get("xATRTrailingStop", 0))
+                zp_pos = int(zp_state.iloc[-1].get("pos", 0))
+                if zp_stop > 0:
+                    if is_buy and zp_pos == 1:
+                        zp_sl = round(zp_stop, digits)
+                        if zp_sl > new_sl:
+                            new_sl = zp_sl
+                            reason_parts.append("ZP-trail")
+                    elif not is_buy and zp_pos == -1:
+                        zp_sl = round(zp_stop, digits)
+                        if new_sl == 0 or zp_sl < new_sl:
+                            new_sl = zp_sl
+                            reason_parts.append("ZP-trail")
+        except Exception:
+            pass
+
+        # --- Apply SL if changed ---
         if new_sl != current_sl and new_sl > 0:
-            reason = []
-            if be_sl is not None and new_sl == be_sl:
-                reason.append("break-even")
-            if trail_sl is not None and new_sl == trail_sl:
-                reason.append("ZP-trail")
-            reason_str = "+".join(reason) or "tighten"
+            reason_str = "+".join(reason_parts) or "V4-tighten"
             self._mt5_modify_sl(ticket, symbol, new_sl, current_tp, reason_str)
 
     def _mt5_close_position(self, ticket: int, symbol: str, action: str, volume: float):
@@ -3248,6 +3362,57 @@ class TradingEngine:
                         self._register_closed_position(self.positions[ticket])
                     return
             self.logger.error(f"ZP close FAILED {symbol}: {result}")
+
+    def _mt5_close_partial(self, ticket: int, symbol: str, action: str, volume: float, comment: str = "V4-partial"):
+        """Close a PARTIAL volume of an open MT5 position (for V4 partials)."""
+        import MetaTrader5 as mt5_lib
+
+        sym_info = mt5_lib.symbol_info(symbol)
+        if sym_info is None:
+            return
+
+        # Snap volume to step
+        vol_step = sym_info.volume_step
+        volume = round(volume / vol_step) * vol_step
+        volume = max(sym_info.volume_min, min(volume, sym_info.volume_max))
+
+        if action == "BUY":
+            close_type = mt5.ORDER_TYPE_SELL
+            price = sym_info.bid
+        else:
+            close_type = mt5.ORDER_TYPE_BUY
+            price = sym_info.ask
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": close_type,
+            "position": ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": 123456,
+            "comment": comment,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_FOK,
+        }
+
+        result = mt5_lib.order_send(request)
+        if result and result.retcode == mt5_lib.TRADE_RETCODE_DONE:
+            self.logger.info(
+                f"V4 PARTIAL CLOSE: {symbol} {action} {volume:.2f} lots ({comment}) @ {price}"
+            )
+        else:
+            # Try other fill modes
+            for fill in [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN]:
+                request["type_filling"] = fill
+                result = mt5_lib.order_send(request)
+                if result and result.retcode == mt5_lib.TRADE_RETCODE_DONE:
+                    self.logger.info(
+                        f"V4 PARTIAL CLOSE: {symbol} {action} {volume:.2f} lots ({comment}) @ {price}"
+                    )
+                    return
+            self.logger.error(f"V4 partial close FAILED {symbol}: {result}")
 
     def _mt5_modify_sl(self, ticket: int, symbol: str, new_sl: float, tp: float, reason: str):
         """Modify SL on an open MT5 position."""
