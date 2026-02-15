@@ -18,6 +18,8 @@ a = Analysis(
         ('scripts/v4_ui.html', 'scripts'),
         # App package (zeropoint_signal, etc.)
         ('app', 'app'),
+        # App icon (PNG for Qt window icon at runtime)
+        ('assets/velocity4.png', 'assets'),
     ],
     hiddenimports=[
         # PySide6 Web Engine
@@ -88,6 +90,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/velocity4.ico',
 )
 
 coll = COLLECT(

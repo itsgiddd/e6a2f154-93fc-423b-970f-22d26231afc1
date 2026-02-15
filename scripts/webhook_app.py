@@ -1047,6 +1047,12 @@ class ACiApp(QMainWindow):
         self.setMinimumSize(1100, 750)
         self.resize(1400, 900)
 
+        # Set window icon (taskbar + title bar)
+        icon_path = _res(os.path.join("assets", "velocity4.png")) if _FROZEN else os.path.join(_SCRIPT_DIR, "..", "assets", "velocity4.png")
+        if os.path.exists(icon_path):
+            from PySide6.QtGui import QIcon
+            self.setWindowIcon(QIcon(icon_path))
+
         self._scanner = None
         self._running = False
         self._trading_enabled = False
