@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-ACi -- Standalone ZeroPoint Trading App
-Fetches candles from MT5, runs ZeroPoint signal detection in Python,
-displays live charts with lightweight-charts, and auto-trades on MT5.
-No TradingView needed.
+Velocity 4 — ZeroPoint Pro Trading App
+Modern web-based UI powered by QWebEngineView + QWebChannel.
+Backend: ScanEngine (signal detection) + TPManager (V4 profit capture).
 """
 
-import sys, os, threading, json, time as _time, logging
+import sys, os, threading, json, time as _time, logging, math
 import traceback as _tb
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -17,18 +17,13 @@ import pandas as pd
 # Ensure project root is on sys.path so "from app.X" / "from models.X" etc. work
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QLabel, QPushButton, QCheckBox, QLineEdit,
-    QGroupBox, QTableWidget, QTableWidgetItem, QTextEdit,
-    QHeaderView, QFrame, QAbstractItemView, QComboBox,
-    QTabWidget, QSplitter, QDialog,
-)
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, Slot, QUrl
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebChannel import QWebChannel
 
 import MetaTrader5 as mt5
-from lightweight_charts.widgets import QtChart
 
 from app.zeropoint_signal import compute_zeropoint_state, ATR_PERIOD, ATR_MULTIPLIER
 from app.zeropoint_signal import TP1_MULT, TP2_MULT, TP3_MULT  # baseline (unused)
@@ -94,386 +89,10 @@ MICRO_CLOSE_PCT = MICRO_TP_PCT  # 15% micro-partial at 0.8x ATR
 # Margin safety — require at least this % free margin after trade
 MIN_MARGIN_LEVEL_PCT = 150   # 150% margin level = safe zone
 
-# ---------------------------------------------------------------------------
-# Stylesheets (from trading_app.py)
-# ---------------------------------------------------------------------------
-CLAUDE_STYLE = """
-QMainWindow, QWidget {
-    background-color: #F4F3EE;
-    color: #141413;
-    font-family: Georgia, Cambria, 'Times New Roman', serif;
-    font-size: 14px;
-}
-QGroupBox {
-    border: 1px solid #D5D3C8;
-    border-radius: 12px;
-    margin-top: 10px;
-    padding-top: 16px;
-    font-weight: bold;
-    color: #3D3929;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 14px;
-    padding: 0 8px;
-}
-QPushButton {
-    background-color: #EEECE2;
-    border: 1px solid #D5D3C8;
-    border-radius: 8px;
-    padding: 8px 20px;
-    color: #3D3929;
-    font-weight: bold;
-    min-height: 28px;
-}
-QPushButton:hover {
-    background-color: #E4E2D8;
-    border-color: #C15F3C;
-}
-QPushButton:pressed {
-    background-color: #D5D3C8;
-}
-QPushButton:disabled {
-    background-color: #F4F3EE;
-    color: #B0AEA5;
-    border-color: #E8E6DC;
-}
-QPushButton#startBtn {
-    background-color: #C15F3C;
-    border: none;
-    color: #FFFFFF;
-}
-QPushButton#startBtn:hover {
-    background-color: #B5523C;
-}
-QPushButton#startBtn:disabled {
-    background-color: #D5D3C8;
-    color: #B0AEA5;
-}
-QPushButton#stopBtn {
-    background-color: #E8E6DC;
-    border: 1px solid #D5D3C8;
-    color: #3D3929;
-}
-QPushButton#stopBtn:hover {
-    background-color: #D5D3C8;
-}
-QPushButton#tradeBtn {
-    background-color: #EEECE2;
-    border: 2px solid #C44444;
-    color: #C44444;
-}
-QPushButton#tradeBtn:hover {
-    background-color: #E4E2D8;
-}
-QPushButton#emergencyBtn {
-    background-color: #C44444;
-    border: none;
-    color: #FFFFFF;
-}
-QPushButton#emergencyBtn:hover {
-    background-color: #A83838;
-}
-QLineEdit {
-    background-color: #EEECE2;
-    border: 1px solid #D5D3C8;
-    border-radius: 8px;
-    padding: 6px 10px;
-    color: #141413;
-}
-QLineEdit:focus {
-    border-color: #C15F3C;
-}
-QCheckBox {
-    spacing: 6px;
-    color: #141413;
-}
-QCheckBox::indicator {
-    width: 16px;
-    height: 16px;
-    border: 1px solid #B0AEA5;
-    border-radius: 4px;
-    background-color: #FAF9F5;
-}
-QCheckBox::indicator:checked {
-    background-color: #C15F3C;
-    border-color: #B5523C;
-}
-QTableWidget {
-    background-color: #FAF9F5;
-    border: 1px solid #D5D3C8;
-    border-radius: 8px;
-    gridline-color: #E8E6DC;
-    selection-background-color: #E8D5C8;
-    color: #141413;
-}
-QTableWidget::item {
-    padding: 4px;
-}
-QHeaderView::section {
-    background-color: #EEECE2;
-    color: #3D3929;
-    border: none;
-    border-bottom: 1px solid #D5D3C8;
-    padding: 6px;
-    font-weight: bold;
-}
-QTextEdit {
-    background-color: #FAF9F5;
-    border: 1px solid #D5D3C8;
-    border-radius: 8px;
-    color: #3D3929;
-    font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace;
-    font-size: 12px;
-}
-QComboBox {
-    background-color: #EEECE2;
-    border: 1px solid #D5D3C8;
-    border-radius: 8px;
-    padding: 6px 10px;
-    color: #141413;
-    min-height: 28px;
-}
-QComboBox:hover {
-    border-color: #C15F3C;
-}
-QComboBox::drop-down {
-    border: none;
-    width: 20px;
-}
-QComboBox QAbstractItemView {
-    background-color: #FAF9F5;
-    border: 1px solid #D5D3C8;
-    selection-background-color: #E8D5C8;
-    color: #141413;
-}
-QTabWidget::pane {
-    border: 1px solid #D5D3C8;
-    border-radius: 8px;
-    background-color: #FAF9F5;
-}
-QTabBar::tab {
-    background-color: #EEECE2;
-    border: 1px solid #D5D3C8;
-    border-bottom: none;
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
-    padding: 6px 14px;
-    color: #3D3929;
-    font-weight: bold;
-    font-size: 12px;
-}
-QTabBar::tab:selected {
-    background-color: #FAF9F5;
-    border-color: #C15F3C;
-    color: #C15F3C;
-}
-QTabBar::tab:hover {
-    background-color: #E4E2D8;
-}
-QLabel#statusLabel {
-    font-size: 12px;
-    padding: 2px 8px;
-}
-QLabel#balanceLabel {
-    font-size: 16px;
-    font-weight: bold;
-    color: #C15F3C;
-}
-QFrame#separator {
-    background-color: #D5D3C8;
-    max-height: 1px;
-}
-"""
+# HTML UI file path
+HTML_UI_PATH = os.path.join(os.path.dirname(__file__), "v4_ui.html")
 
-DARK_STYLE = """
-QMainWindow, QWidget {
-    background-color: #1A1815;
-    color: #E8E6E3;
-    font-family: Georgia, Cambria, 'Times New Roman', serif;
-    font-size: 14px;
-}
-QGroupBox {
-    border: 1px solid #3A352B;
-    border-radius: 12px;
-    margin-top: 10px;
-    padding-top: 16px;
-    font-weight: bold;
-    color: #B5AFA5;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 14px;
-    padding: 0 8px;
-}
-QPushButton {
-    background-color: #2A251D;
-    border: 1px solid #3A352B;
-    border-radius: 8px;
-    padding: 8px 20px;
-    color: #E8E6E3;
-    font-weight: bold;
-    min-height: 28px;
-}
-QPushButton:hover {
-    background-color: #342E24;
-    border-color: #C15F3C;
-}
-QPushButton:pressed {
-    background-color: #3A352B;
-}
-QPushButton:disabled {
-    background-color: #1A1815;
-    color: #4A453B;
-    border-color: #2A251D;
-}
-QPushButton#startBtn {
-    background-color: #C15F3C;
-    border: none;
-    color: #FFFFFF;
-}
-QPushButton#startBtn:hover {
-    background-color: #B5523C;
-}
-QPushButton#startBtn:disabled {
-    background-color: #2A251D;
-    color: #4A453B;
-}
-QPushButton#stopBtn {
-    background-color: #2A251D;
-    border: 1px solid #3A352B;
-    color: #E8E6E3;
-}
-QPushButton#stopBtn:hover {
-    background-color: #342E24;
-}
-QPushButton#tradeBtn {
-    background-color: #2A251D;
-    border: 2px solid #C44444;
-    color: #C44444;
-}
-QPushButton#tradeBtn:hover {
-    background-color: #342E24;
-}
-QPushButton#emergencyBtn {
-    background-color: #C44444;
-    border: none;
-    color: #FFFFFF;
-}
-QPushButton#emergencyBtn:hover {
-    background-color: #A83838;
-}
-QLineEdit {
-    background-color: #201D18;
-    border: 1px solid #3A352B;
-    border-radius: 8px;
-    padding: 6px 10px;
-    color: #E8E6E3;
-}
-QLineEdit:focus {
-    border-color: #C15F3C;
-}
-QCheckBox {
-    spacing: 6px;
-    color: #E8E6E3;
-}
-QCheckBox::indicator {
-    width: 16px;
-    height: 16px;
-    border: 1px solid #4A453B;
-    border-radius: 4px;
-    background-color: #201D18;
-}
-QCheckBox::indicator:checked {
-    background-color: #C15F3C;
-    border-color: #B5523C;
-}
-QTableWidget {
-    background-color: #201D18;
-    border: 1px solid #3A352B;
-    border-radius: 8px;
-    gridline-color: #2A251D;
-    selection-background-color: #3A352B;
-    color: #E8E6E3;
-}
-QTableWidget::item {
-    padding: 4px;
-}
-QHeaderView::section {
-    background-color: #2A251D;
-    color: #B5AFA5;
-    border: none;
-    border-bottom: 1px solid #3A352B;
-    padding: 6px;
-    font-weight: bold;
-}
-QTextEdit {
-    background-color: #161411;
-    border: 1px solid #3A352B;
-    border-radius: 8px;
-    color: #B5AFA5;
-    font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace;
-    font-size: 12px;
-}
-QComboBox {
-    background-color: #2A251D;
-    border: 1px solid #3A352B;
-    border-radius: 8px;
-    padding: 6px 10px;
-    color: #E8E6E3;
-    min-height: 28px;
-}
-QComboBox:hover {
-    border-color: #C15F3C;
-}
-QComboBox::drop-down {
-    border: none;
-    width: 20px;
-}
-QComboBox QAbstractItemView {
-    background-color: #201D18;
-    border: 1px solid #3A352B;
-    selection-background-color: #3A352B;
-    color: #E8E6E3;
-}
-QTabWidget::pane {
-    border: 1px solid #3A352B;
-    border-radius: 8px;
-    background-color: #201D18;
-}
-QTabBar::tab {
-    background-color: #2A251D;
-    border: 1px solid #3A352B;
-    border-bottom: none;
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
-    padding: 6px 14px;
-    color: #B5AFA5;
-    font-weight: bold;
-    font-size: 12px;
-}
-QTabBar::tab:selected {
-    background-color: #201D18;
-    border-color: #C15F3C;
-    color: #C15F3C;
-}
-QTabBar::tab:hover {
-    background-color: #342E24;
-}
-QLabel#statusLabel {
-    font-size: 12px;
-    padding: 2px 8px;
-}
-QLabel#balanceLabel {
-    font-size: 16px;
-    font-weight: bold;
-    color: #C15F3C;
-}
-QFrame#separator {
-    background-color: #3A352B;
-    max-height: 1px;
-}
-"""
+
 
 
 # ---------------------------------------------------------------------------
@@ -639,20 +258,54 @@ class ScanEngine(QObject):
     def stop(self):
         self._running = False
 
+    def _execute_trade_intent(self, intent):
+        """Execute a single trade intent. Called from ThreadPoolExecutor."""
+        try:
+            success = self._place_trade(
+                intent["resolved"], intent["direction"], intent["lot"],
+                intent["sl"], intent["tp1"], intent["sym_info"])
+            if success:
+                self._entered_signals[intent["symbol"]] = intent["bar_time"]
+                self.log_message.emit(
+                    f"[{intent['symbol']}] Trade executed: {intent['direction']} "
+                    f"{intent['lot']:.2f}L{intent['age_str']}")
+            return success
+        except Exception as e:
+            self.log_message.emit(f"[{intent['symbol']}] Async trade error: {e}")
+            return False
+
     def _scan_loop(self):
         self.log_message.emit(f"Scanner started | {self._tf_key} | {len(self._symbols)} symbols | poll={self._poll}s")
         first_scan = True
 
         while self._running:
             scanned = 0
+            trade_intents = []
             for symbol in self._symbols:
                 if not self._running:
                     break
                 try:
-                    self._scan_symbol(symbol)
+                    intent = self._scan_symbol(symbol)
+                    if intent is not None:
+                        trade_intents.append(intent)
                     scanned += 1
                 except Exception as e:
                     self.log_message.emit(f"[{symbol}] Scan error: {e}")
+
+            # Execute all trade intents concurrently via ThreadPoolExecutor
+            if trade_intents:
+                n = len(trade_intents)
+                syms = ", ".join(t["symbol"] for t in trade_intents)
+                self.log_message.emit(f"Batch executing {n} trades: {syms}")
+                with ThreadPoolExecutor(max_workers=min(n, 4)) as executor:
+                    futures = {executor.submit(self._execute_trade_intent, t): t
+                               for t in trade_intents}
+                    for fut in as_completed(futures):
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            t = futures[fut]
+                            self.log_message.emit(f"[{t['symbol']}] Batch exec error: {e}")
 
             if first_scan:
                 self.log_message.emit(f"Scan complete: {scanned}/{len(self._symbols)} pairs checked")
@@ -671,8 +324,8 @@ class ScanEngine(QObject):
         if resolved is None:
             return
 
-        # Fetch OHLCV — 500 bars for full historical view
-        rates = mt5.copy_rates_from_pos(resolved, self._tf_mt5, 0, 500)
+        # Fetch OHLCV — 1000 bars for full historical view
+        rates = mt5.copy_rates_from_pos(resolved, self._tf_mt5, 0, 1000)
         if rates is None or len(rates) < 20:
             return
 
@@ -805,18 +458,23 @@ class ScanEngine(QObject):
         # Place trade at CURRENT price (not signal price)
         lot = self._calc_lot_size(current_price, sl_val, sym_info, self._risk_pct, self._default_lot)
         if lot <= 0:
-            return
+            return None
 
-        success = self._place_trade(resolved, direction, lot, sl_val, tp1, sym_info)
-        if success:
-            self._entered_signals[symbol] = bar_time  # mark as traded
-            self.log_message.emit(f"[{symbol}] Trade executed: {direction} {lot:.2f}L{age_str}")
+        # Return trade intent for async batch execution
+        return {
+            "symbol": symbol, "resolved": resolved, "direction": direction,
+            "lot": lot, "sl": sl_val, "tp1": tp1, "sym_info": sym_info,
+            "bar_time": bar_time, "age_str": age_str,
+        }
 
 
 # ---------------------------------------------------------------------------
 # V4 TP Manager — Full 5-layer profit capture system
 # Layers: Micro-Partial | Early BE | Tighter TPs | Post-TP1 Trail | Stall Exit
 # ---------------------------------------------------------------------------
+STATE_FILE = os.path.join(os.path.dirname(__file__), "tp_state.json")
+
+
 class TPManager(QObject):
     """V4 Trade Manager: 5-layer profit capture matching backtested system."""
 
@@ -834,10 +492,51 @@ class TPManager(QObject):
             "micro_tp": MICRO_TP_MULT, "micro_pct": MICRO_TP_PCT,
             "stall_bars": STALL_BARS, "trail_dist": PROFIT_TRAIL_DISTANCE_MULT,
         }
+        self._load_state()
 
     def set_v4_params(self, params: dict):
         """Update V4 profit capture parameters from UI settings."""
         self._v4.update(params)
+
+    # ── State persistence ──
+
+    def _save_state(self):
+        """Persist trade_info + tp_state to JSON for crash recovery."""
+        try:
+            data = {
+                "trade_info": {str(k): v for k, v in self._trade_info.items()},
+                "tp_state": {str(k): v for k, v in self._tp_state.items()},
+            }
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, STATE_FILE)  # atomic on Windows
+        except Exception as e:
+            log.warning(f"State save error: {e}")
+
+    def _load_state(self):
+        """Reload persisted state on startup, pruning tickets no longer open in MT5."""
+        if not os.path.exists(STATE_FILE):
+            return
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+            loaded_info = {int(k): v for k, v in data.get("trade_info", {}).items()}
+            loaded_state = {int(k): v for k, v in data.get("tp_state", {}).items()}
+
+            # Prune tickets that are no longer open in MT5
+            if mt5.terminal_info() is not None:
+                positions = mt5.positions_get()
+                open_tickets = {p.ticket for p in positions} if positions else set()
+                loaded_info = {k: v for k, v in loaded_info.items() if k in open_tickets}
+                loaded_state = {k: v for k, v in loaded_state.items() if k in open_tickets}
+
+            if loaded_info:
+                self._trade_info.update(loaded_info)
+                self._tp_state.update(loaded_state)
+                log.info(f"Restored state for {len(loaded_info)} positions from tp_state.json")
+        except Exception as e:
+            log.warning(f"State load error: {e}")
 
     def register_trade(self, ticket, direction, entry, sl, tp1, tp2, tp3, atr_val, original_lot):
         """Register a new trade for V4 profit capture management."""
@@ -865,11 +564,15 @@ class TPManager(QObject):
             f"  V4 Manager: #{ticket} | TP1={tp1:.5f} TP2={tp2:.5f} TP3={tp3:.5f} | "
             f"BE@{v['be_trigger']}x Stall@{v['stall_bars']}bars Trail@{v['trail_dist']}x"
         )
+        self._save_state()
 
     def start(self):
         self._running = True
         t = threading.Thread(target=self._monitor_loop, daemon=True)
         t.start()
+        # Fast tick-polling thread for time-critical BE/Micro-TP triggers
+        t2 = threading.Thread(target=self._tick_monitor_loop, daemon=True)
+        t2.start()
 
     def stop(self):
         self._running = False
@@ -882,6 +585,103 @@ class TPManager(QObject):
                 self.log_message.emit(f"V4 Manager error: {e}")
             _time.sleep(2)
 
+    def _tick_monitor_loop(self):
+        """Fast tick-level monitor (0.5s) for Layer 1 Micro-TP and Layer 2 Early BE.
+
+        Uses mt5.copy_ticks_from() to capture intra-bar price spikes that the
+        2-second main loop might miss. Only checks positions that haven't yet
+        triggered BE — once BE is activated, the main loop handles trailing.
+        """
+        while self._running:
+            try:
+                self._check_tick_triggers()
+            except Exception as e:
+                self.log_message.emit(f"Tick monitor error: {e}")
+            _time.sleep(0.5)
+
+    def _check_tick_triggers(self):
+        """Fast tick check — only Micro-TP and Early BE on positions that need it."""
+        positions = mt5.positions_get()
+        if not positions:
+            return
+
+        for pos in positions:
+            if pos.magic != MAGIC_NUMBER:
+                continue
+            ticket = pos.ticket
+            if ticket not in self._trade_info:
+                continue
+
+            state = self._tp_state[ticket]
+            # Skip if both micro-TP and BE are already activated
+            if state["micro_tp"] and state["be_activated"]:
+                continue
+
+            info = self._trade_info[ticket]
+            direction = info["direction"]
+            entry = info["entry"]
+            atr = info["atr"]
+            is_buy = direction == "BUY"
+
+            sym_info = mt5.symbol_info(pos.symbol)
+            if not sym_info:
+                continue
+
+            # Get recent ticks (last 2 seconds) for high/low price discovery
+            now = datetime.now()
+            ticks = mt5.copy_ticks_from(pos.symbol, now, 100, mt5.COPY_TICKS_ALL)
+            if ticks is not None and len(ticks) > 0:
+                # Find the extreme favorable price across recent ticks
+                if is_buy:
+                    tick_best = max(t[1] for t in ticks)  # highest bid
+                else:
+                    tick_best = min(t[2] for t in ticks)  # lowest ask
+            else:
+                # Fallback to current price
+                tick_best = sym_info.bid if is_buy else sym_info.ask
+
+            # Update max_favorable from ticks
+            if is_buy and tick_best > state["max_favorable"]:
+                state["max_favorable"] = tick_best
+            elif not is_buy and tick_best < state["max_favorable"]:
+                state["max_favorable"] = tick_best
+
+            max_profit_dist = abs(state["max_favorable"] - entry)
+            _v = self._v4
+
+            # ── Fast Micro-TP check ──
+            if not state["micro_tp"] and not state["tp1"]:
+                micro_level = entry + (_v["micro_tp"] * atr if is_buy else -_v["micro_tp"] * atr)
+                micro_hit = (is_buy and tick_best >= micro_level) or (not is_buy and tick_best <= micro_level)
+                if micro_hit:
+                    original_lot = info["original_lot"]
+                    close_lot = round(original_lot * _v["micro_pct"], 2)
+                    vol_step = sym_info.volume_step
+                    vol_min = sym_info.volume_min
+                    close_lot = max(vol_min, round(close_lot / vol_step) * vol_step)
+                    close_lot = min(close_lot, pos.volume)
+                    if close_lot >= vol_min:
+                        ok = self._partial_close(pos, close_lot, sym_info)
+                        if ok:
+                            state["micro_tp"] = True
+                            self.log_message.emit(
+                                f"  TICK MICRO-TP: {pos.symbol} closed {close_lot:.2f}L "
+                                f"(tick={tick_best:.5f})")
+
+            # ── Fast Early BE check ──
+            if not state["be_activated"]:
+                if max_profit_dist >= _v["be_trigger"] * atr:
+                    be_buffer_price = _v["be_buffer"] * atr
+                    be_level = entry + (be_buffer_price if is_buy else -be_buffer_price)
+                    should_move = (is_buy and be_level > pos.sl) or (not is_buy and be_level < pos.sl)
+                    if should_move and self._is_spread_safe(sym_info, be_buffer_price):
+                        ok = self._move_sl(pos, be_level, sym_info)
+                        if ok:
+                            state["be_activated"] = True
+                            self.log_message.emit(
+                                f"  TICK BE: {pos.symbol} SL -> {be_level:.5f} "
+                                f"(tick peak={tick_best:.5f})")
+
     def _check_positions(self):
         positions = mt5.positions_get()
         if not positions:
@@ -890,9 +690,11 @@ class TPManager(QObject):
         # Clean up closed trades
         open_tickets = {p.ticket for p in positions}
         closed = [t for t in self._trade_info if t not in open_tickets]
-        for t in closed:
-            self._trade_info.pop(t, None)
-            self._tp_state.pop(t, None)
+        if closed:
+            for t in closed:
+                self._trade_info.pop(t, None)
+                self._tp_state.pop(t, None)
+            self._save_state()
 
         for pos in positions:
             if pos.magic != MAGIC_NUMBER:
@@ -958,10 +760,11 @@ class TPManager(QObject):
             # ── Layer 2: Early BE at be_trigger * ATR ──
             if not state["be_activated"]:
                 if max_profit_dist >= _be_trigger * atr:
-                    be_level = entry + (_be_buffer * atr if is_buy else -_be_buffer * atr)
+                    be_buffer_price = _be_buffer * atr
+                    be_level = entry + (be_buffer_price if is_buy else -be_buffer_price)
                     # Only move SL if it improves (tighter)
                     should_move = (is_buy and be_level > pos.sl) or (not is_buy and be_level < pos.sl)
-                    if should_move:
+                    if should_move and self._is_spread_safe(sym_info, be_buffer_price):
                         ok = self._move_sl(pos, be_level, sym_info)
                         if ok:
                             state["be_activated"] = True
@@ -974,9 +777,10 @@ class TPManager(QObject):
                 # Approximate bars: each check is 2s, H4 bar = 14400s
                 approx_bars = state["checks"] * 2 / 14400
                 if approx_bars >= _stall_bars:
-                    be_level = entry + (_be_buffer * atr if is_buy else -_be_buffer * atr)
+                    be_buffer_price = _be_buffer * atr
+                    be_level = entry + (be_buffer_price if is_buy else -be_buffer_price)
                     should_move = (is_buy and be_level > pos.sl) or (not is_buy and be_level < pos.sl)
-                    if should_move:
+                    if should_move and self._is_spread_safe(sym_info, be_buffer_price):
                         ok = self._move_sl(pos, be_level, sym_info)
                         if ok:
                             state["stall_be"] = True
@@ -1002,9 +806,11 @@ class TPManager(QObject):
                             state["tp1"] = True
                             # Move SL to BE if not already
                             if not state["be_activated"]:
-                                be_level = entry + (_be_buffer * atr if is_buy else -_be_buffer * atr)
-                                self._move_sl(pos, be_level, sym_info)
-                                state["be_activated"] = True
+                                be_buffer_price = _be_buffer * atr
+                                be_level = entry + (be_buffer_price if is_buy else -be_buffer_price)
+                                if self._is_spread_safe(sym_info, be_buffer_price):
+                                    self._move_sl(pos, be_level, sym_info)
+                                    state["be_activated"] = True
                             self.log_message.emit(
                                 f"  TP1 HIT: {pos.symbol} closed {close_lot:.2f}L "
                                 f"@ {current:.5f} | Trail activated")
@@ -1075,6 +881,10 @@ class TPManager(QObject):
                                 f"  TP3 HIT: {pos.symbol} CLOSED ALL {cur_vol:.2f}L "
                                 f"@ {current:.5f}")
 
+        # Persist state after each full cycle (covers all mutations above)
+        if self._trade_info:
+            self._save_state()
+
     def _partial_close(self, pos, close_volume, sym_info):
         """Partially close a position."""
         try:
@@ -1106,12 +916,34 @@ class TPManager(QObject):
             self.log_message.emit(f"  Partial close error: {e}")
             return False
 
+    def _is_spread_safe(self, sym_info, be_buffer_price):
+        """Check if current spread is safe for SL modification.
+
+        Returns True if spread < 50% of the BE buffer (in price units).
+        During rollover/news, spreads widen 5-10x and would eat the entire
+        buffer, causing instant stop-out after moving SL to BE.
+        """
+        spread = sym_info.ask - sym_info.bid
+        if be_buffer_price <= 0:
+            return False
+        if spread > be_buffer_price * 0.50:
+            self.log_message.emit(
+                f"  SPREAD GUARD: {sym_info.name} spread={spread:.5f} > "
+                f"50% of buffer={be_buffer_price:.5f} — SL move SKIPPED")
+            return False
+        return True
+
     def _move_sl_to_be(self, pos, entry, sym_info):
         """Move SL to breakeven (entry price)."""
         self._move_sl(pos, entry, sym_info)
 
-    def _move_sl(self, pos, new_sl, sym_info):
-        """Modify position SL."""
+    def _move_sl(self, pos, new_sl, sym_info, skip_spread_check=False):
+        """Modify position SL.
+
+        Args:
+            skip_spread_check: If True, bypass spread safety check (used for
+                               trailing stops that move SL further from price).
+        """
         try:
             digits = sym_info.digits
             request = {
@@ -1136,23 +968,87 @@ class TPManager(QObject):
 # ---------------------------------------------------------------------------
 # Main App
 # ---------------------------------------------------------------------------
+# WebBridge — Python <-> JavaScript communication via QWebChannel
+# ---------------------------------------------------------------------------
+class WebBridge(QObject):
+    """Exposes Python methods callable from JavaScript UI."""
+
+    def __init__(self, app):
+        super().__init__()
+        self._app = app
+
+    @Slot(str)
+    def startScanner(self, config_json=""):
+        self._app._on_start()
+
+    @Slot()
+    def stopScanner(self):
+        self._app._on_stop()
+
+    @Slot()
+    def toggleTrading(self):
+        self._app._toggle_trading()
+
+    @Slot()
+    def closeAll(self):
+        self._app._on_close_all()
+
+    @Slot(str)
+    def updateSettings(self, settings_json):
+        try:
+            settings = json.loads(settings_json)
+            self._app._apply_settings(settings)
+        except Exception as e:
+            self._app._log(f"Settings update error: {e}")
+
+    @Slot(result=str)
+    def requestInitialState(self):
+        return json.dumps(self._app._get_full_state())
+
+    @Slot(str)
+    def selectPair(self, symbol):
+        self._app._current_pair = symbol
+
+    @Slot()
+    def refreshNews(self):
+        self._app._fetch_and_push_news()
+
+
+# ---------------------------------------------------------------------------
+# Main App — Thin PySide6 shell with QWebEngineView
+# ---------------------------------------------------------------------------
 class ACiApp(QMainWindow):
     _log_signal = Signal(str)
+    _news_ready = Signal(str, str)  # news_json, sentiment_json
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ACi  —  V4 ZeroPoint Pro  |  97.5% WR")
-        self.setMinimumSize(900, 700)
-        self.resize(1200, 850)
+        self.setWindowTitle("Velocity 4")
+        self.setMinimumSize(1100, 750)
+        self.resize(1400, 900)
 
-        self._dark_mode = True
         self._scanner = None
         self._running = False
         self._trading_enabled = False
         self._chart_data = {}       # {symbol: DataFrame}  — cached for chart
-        self._chart_initialized = {}  # {symbol: bool}
+        self._chart_loaded = {}     # {symbol: bool}
         self._starting_balance = None  # set on first MT5 connect for growth calc
-        self._positions_dialog = None
+        self._current_pair = "EURUSD"
+
+        # Settings dict — replaces per-widget reads
+        self._settings = {
+            "risk": "30", "lots": "0.40", "max_trades": "5",
+            "poll_sec": "30", "timeframe": "H4",
+            "pairs": {s: True for s in ALL_PAIRS},
+            "v4_tp1": str(TP1_MULT_AGG), "v4_tp2": str(TP2_MULT_AGG),
+            "v4_tp3": str(TP3_MULT_AGG),
+            "v4_be_trigger": str(BE_TRIGGER_MULT),
+            "v4_be_buffer": str(BE_BUFFER_MULT),
+            "v4_micro_tp": str(MICRO_TP_MULT),
+            "v4_micro_pct": str(int(MICRO_TP_PCT * 100)),
+            "v4_stall": str(STALL_BARS),
+            "v4_trail": str(PROFIT_TRAIL_DISTANCE_MULT),
+        }
 
         # TP Manager
         self._tp_manager = TPManager()
@@ -1160,355 +1056,113 @@ class ACiApp(QMainWindow):
         self._tp_manager.start()
 
         self._log_signal.connect(self._log_on_main_thread)
+        self._news_ready.connect(self._on_news_ready)
 
-        self._build_ui()
         self._load_settings()
-        # Push V4 params to TP manager after UI is built + settings loaded
+        self._build_web_ui()
+
+        # Push V4 params to TP manager after settings loaded
         self._tp_manager.set_v4_params(self._get_v4_params())
-        self.setStyleSheet(DARK_STYLE)
 
         # MT5 check on startup
         self._check_mt5()
 
-        # Live position refresh
+        # Live position refresh (2s)
         self._timer = QTimer()
         self._timer.timeout.connect(self._update_live)
         self._timer.start(2000)
 
-    # ── Build UI ──
+        # Portfolio refresh (60s — deal history doesn't change every tick)
+        self._portfolio_timer = QTimer()
+        self._portfolio_timer.timeout.connect(self._push_portfolio)
+        self._portfolio_timer.start(60000)
 
-    def _build_ui(self):
+        # Market news refresh (5 min — calendar data doesn't change fast)
+        self._news_timer = QTimer()
+        self._news_timer.timeout.connect(self._fetch_and_push_news)
+        self._news_timer.start(300000)
+
+    # ── Build Web UI ──
+
+    def _build_web_ui(self):
+        """Create QWebEngineView with QWebChannel bridge to v4_ui.html."""
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(14, 10, 14, 10)
-        main_layout.setSpacing(8)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # --- Status bar row 1: connection + scanner ---
-        status_row = QHBoxLayout()
-        self.lbl_mt5 = QLabel("MT5: --")
-        self.lbl_mt5.setObjectName("statusLabel")
-        status_row.addWidget(self.lbl_mt5)
+        self._web = QWebEngineView()
+        self._web.setStyleSheet("background-color: #0B0B11;")
 
-        self.lbl_scanner = QLabel("Scanner: OFF")
-        self.lbl_scanner.setObjectName("statusLabel")
-        status_row.addWidget(self.lbl_scanner)
+        # Allow file:// pages to load external CDN resources (Tailwind, fonts, icons, charts)
+        ws = self._web.page().settings()
+        ws.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
 
-        status_row.addStretch()
+        # Set up QWebChannel
+        self._channel = QWebChannel()
+        self._bridge = WebBridge(self)
+        self._channel.registerObject("v4bridge", self._bridge)
+        self._web.page().setWebChannel(self._channel)
 
-        # Account stats row
-        self.lbl_balance = QLabel("Bal: $0.00")
-        self.lbl_balance.setObjectName("balanceLabel")
-        status_row.addWidget(self.lbl_balance)
+        # Load HTML
+        html_path = os.path.abspath(HTML_UI_PATH)
+        self._web.setUrl(QUrl.fromLocalFile(html_path))
+        self._web.loadFinished.connect(self._on_web_loaded)
 
-        self.lbl_equity = QLabel("Eq: $0.00")
-        self.lbl_equity.setObjectName("statusLabel")
-        self.lbl_equity.setStyleSheet("font-weight: bold; font-size: 13px;")
-        status_row.addWidget(self.lbl_equity)
+        layout.addWidget(self._web)
 
-        self.lbl_margin = QLabel("Margin: $0.00")
-        self.lbl_margin.setObjectName("statusLabel")
-        status_row.addWidget(self.lbl_margin)
+    def _on_web_loaded(self, ok):
+        """Push initial state to JS after HTML loads."""
+        if not ok:
+            log.error("Failed to load v4_ui.html")
+            return
+        self._log("Web UI loaded successfully")
+        # Push initial state after a small delay for bridge to init
+        QTimer.singleShot(500, self._push_initial_state)
 
-        self.lbl_free_margin = QLabel("Free: $0.00")
-        self.lbl_free_margin.setObjectName("statusLabel")
-        status_row.addWidget(self.lbl_free_margin)
+    def _push_initial_state(self):
+        """Send full app state to the JS UI."""
+        state = self._get_full_state()
+        js = f"if (typeof applyInitialState === 'function') applyInitialState({json.dumps(state)});"
+        self._push_to_js(js)
+        # Re-push MT5 status so JS badge updates after bridge is ready
+        try:
+            acct = mt5.account_info()
+            if acct:
+                self._push_to_js(f"updateMT5Status(true, '{acct.login}')")
+            else:
+                self._push_to_js("updateMT5Status(false, '')")
+        except Exception:
+            pass
 
-        self.lbl_growth = QLabel("Growth: 0.0%")
-        self.lbl_growth.setObjectName("statusLabel")
-        self.lbl_growth.setStyleSheet("font-weight: bold; font-size: 13px;")
-        status_row.addWidget(self.lbl_growth)
+        # Push portfolio equity curve
+        QTimer.singleShot(1500, self._push_portfolio)
 
-        main_layout.addLayout(status_row)
+        # Push market news + sentiment
+        QTimer.singleShot(2500, self._fetch_and_push_news)
 
-        # --- Separator ---
-        sep = QFrame()
-        sep.setObjectName("separator")
-        sep.setFrameShape(QFrame.Shape.HLine)
-        main_layout.addWidget(sep)
+        # Auto-start scanner on launch (after UI is ready)
+        if not self._running:
+            self._log("Auto-starting scanner...")
+            QTimer.singleShot(2000, self._on_start)
 
-        # --- Button row ---
-        btn_row = QHBoxLayout()
+    def _push_to_js(self, js_call):
+        """Execute JavaScript in the web view."""
+        try:
+            self._web.page().runJavaScript(js_call)
+        except Exception as e:
+            log.warning(f"JS push error: {e}")
 
-        self.btn_start = QPushButton("Start Scanner")
-        self.btn_start.setObjectName("startBtn")
-        self.btn_start.clicked.connect(self._on_start)
-        btn_row.addWidget(self.btn_start)
+    # ── Full State for JS init ──
 
-        self.btn_stop = QPushButton("Stop")
-        self.btn_stop.setObjectName("stopBtn")
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self._on_stop)
-        btn_row.addWidget(self.btn_stop)
-
-        self.btn_trade = QPushButton("Trade: OFF")
-        self.btn_trade.setObjectName("tradeBtn")
-        self.btn_trade.clicked.connect(self._toggle_trading)
-        btn_row.addWidget(self.btn_trade)
-
-        self.btn_positions = QPushButton("Positions")
-        self.btn_positions.clicked.connect(self._show_positions_dialog)
-        btn_row.addWidget(self.btn_positions)
-
-        self.btn_theme = QPushButton("Light Mode")
-        self.btn_theme.clicked.connect(self._toggle_theme)
-        btn_row.addWidget(self.btn_theme)
-
-        btn_row.addStretch()
-
-        self.btn_close_all = QPushButton("Close All")
-        self.btn_close_all.setObjectName("emergencyBtn")
-        self.btn_close_all.clicked.connect(self._on_close_all)
-        btn_row.addWidget(self.btn_close_all)
-
-        main_layout.addLayout(btn_row)
-
-        # --- Trade Execution Settings (3 rows in one group) ---
-        settings_group = QGroupBox("Trade Execution  —  V4 Profit Capture")
-        settings_main = QVBoxLayout(settings_group)
-        settings_main.setSpacing(6)
-
-        # ── Row 1: Core execution params ──
-        row1 = QHBoxLayout()
-        row1.setSpacing(12)
-
-        row1.addWidget(QLabel("Risk %:"))
-        self.inp_risk = QLineEdit("30")
-        self.inp_risk.setFixedWidth(40)
-        self.inp_risk.setToolTip("Risk per trade (30% = half-Kelly for 97.5% WR)")
-        row1.addWidget(self.inp_risk)
-
-        row1.addWidget(QLabel("Lots:"))
-        self.inp_lots = QLineEdit("0.40")
-        self.inp_lots.setFixedWidth(50)
-        self.inp_lots.setToolTip("Default lot size (overridden by risk-based sizing)")
-        row1.addWidget(self.inp_lots)
-
-        row1.addWidget(QLabel("Max:"))
-        self.inp_max_trades = QLineEdit("5")
-        self.inp_max_trades.setFixedWidth(30)
-        self.inp_max_trades.setToolTip("Max concurrent trades across all pairs")
-        row1.addWidget(self.inp_max_trades)
-
-        row1.addWidget(QLabel("Poll (sec):"))
-        self.inp_poll = QLineEdit("30")
-        self.inp_poll.setFixedWidth(40)
-        row1.addWidget(self.inp_poll)
-
-        row1.addWidget(QLabel("Timeframe:"))
-        self.combo_tf = QComboBox()
-        self.combo_tf.setFixedWidth(70)
-        for tf in TIMEFRAMES:
-            self.combo_tf.addItem(tf, tf)
-        self.combo_tf.setCurrentIndex(5)  # H4 default
-        self.combo_tf.currentIndexChanged.connect(self._on_tf_changed)
-        row1.addWidget(self.combo_tf)
-
-        row1.addStretch()
-        settings_main.addLayout(row1)
-
-        # ── Thin separator ──
-        sep_h = QFrame()
-        sep_h.setFrameShape(QFrame.Shape.HLine)
-        sep_h.setStyleSheet("color: #3A352B;")
-        settings_main.addWidget(sep_h)
-
-        # ── Row 2: V4 TPs + Breakeven ──
-        _tp = "color: #4ADE80; font-weight: bold; font-size: 12px;"
-        _be = "color: #FBBF24; font-weight: bold; font-size: 12px;"
-        _mi = "color: #38BDF8; font-weight: bold; font-size: 12px;"
-        _tr = "color: #A78BFA; font-weight: bold; font-size: 12px;"
-        _u = "font-size: 11px;"
-
-        row2 = QHBoxLayout()
-        row2.setSpacing(12)
-
-        lbl = QLabel("TP1:"); lbl.setStyleSheet(_tp); row2.addWidget(lbl)
-        self.inp_tp1 = QLineEdit(str(TP1_MULT_AGG))
-        self.inp_tp1.setFixedWidth(40)
-        self.inp_tp1.setToolTip("TP1 distance in ATR multiples (V4: 0.8)")
-        row2.addWidget(self.inp_tp1)
-        lbl = QLabel("x"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
-
-        lbl = QLabel("TP2:"); lbl.setStyleSheet(_tp); row2.addWidget(lbl)
-        self.inp_tp2 = QLineEdit(str(TP2_MULT_AGG))
-        self.inp_tp2.setFixedWidth(40)
-        self.inp_tp2.setToolTip("TP2 distance in ATR multiples (V4: 2.0)")
-        row2.addWidget(self.inp_tp2)
-        lbl = QLabel("x"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
-
-        lbl = QLabel("TP3:"); lbl.setStyleSheet(_tp); row2.addWidget(lbl)
-        self.inp_tp3 = QLineEdit(str(TP3_MULT_AGG))
-        self.inp_tp3.setFixedWidth(40)
-        self.inp_tp3.setToolTip("TP3 distance in ATR multiples (V4: 5.0)")
-        row2.addWidget(self.inp_tp3)
-        lbl = QLabel("x ATR"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
-
-        sep_v = QFrame(); sep_v.setFrameShape(QFrame.Shape.VLine)
-        sep_v.setStyleSheet("color: #3A352B;"); row2.addWidget(sep_v)
-
-        lbl = QLabel("BE:"); lbl.setStyleSheet(_be); row2.addWidget(lbl)
-        self.inp_be_trigger = QLineEdit(str(BE_TRIGGER_MULT))
-        self.inp_be_trigger.setFixedWidth(36)
-        self.inp_be_trigger.setToolTip("Move SL to breakeven at this ATR multiple (0.5)")
-        row2.addWidget(self.inp_be_trigger)
-        lbl = QLabel("x"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
-
-        lbl = QLabel("Buf:"); lbl.setStyleSheet(_be); row2.addWidget(lbl)
-        self.inp_be_buffer = QLineEdit(str(BE_BUFFER_MULT))
-        self.inp_be_buffer.setFixedWidth(36)
-        self.inp_be_buffer.setToolTip("BE SL set to entry + buffer (0.15 = slight profit)")
-        row2.addWidget(self.inp_be_buffer)
-        lbl = QLabel("x ATR"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
-
-        row2.addStretch()
-        settings_main.addLayout(row2)
-
-        # ── Row 3: Micro-partial + Stall + Trail + live status ──
-        row3 = QHBoxLayout()
-        row3.setSpacing(12)
-
-        lbl = QLabel("Micro:"); lbl.setStyleSheet(_mi); row3.addWidget(lbl)
-        self.inp_micro_tp = QLineEdit(str(MICRO_TP_MULT))
-        self.inp_micro_tp.setFixedWidth(36)
-        self.inp_micro_tp.setToolTip("Take micro-partial at this ATR distance (0.8x)")
-        row3.addWidget(self.inp_micro_tp)
-        lbl = QLabel("x ATR"); lbl.setStyleSheet(_u); row3.addWidget(lbl)
-
-        lbl = QLabel("Take:"); lbl.setStyleSheet(_mi); row3.addWidget(lbl)
-        self.inp_micro_pct = QLineEdit(str(int(MICRO_TP_PCT * 100)))
-        self.inp_micro_pct.setFixedWidth(30)
-        self.inp_micro_pct.setToolTip("Percent of lot to close at micro-TP (15%)")
-        row3.addWidget(self.inp_micro_pct)
-        lbl = QLabel("%"); lbl.setStyleSheet(_u); row3.addWidget(lbl)
-
-        sep_v2 = QFrame(); sep_v2.setFrameShape(QFrame.Shape.VLine)
-        sep_v2.setStyleSheet("color: #3A352B;"); row3.addWidget(sep_v2)
-
-        lbl = QLabel("Stall:"); lbl.setStyleSheet(_tr); row3.addWidget(lbl)
-        self.inp_stall = QLineEdit(str(STALL_BARS))
-        self.inp_stall.setFixedWidth(30)
-        self.inp_stall.setToolTip("Move SL to BE after this many H4 bars without TP1 (6)")
-        row3.addWidget(self.inp_stall)
-        lbl = QLabel("bars"); lbl.setStyleSheet(_u); row3.addWidget(lbl)
-
-        lbl = QLabel("Trail:"); lbl.setStyleSheet(_tr); row3.addWidget(lbl)
-        self.inp_trail = QLineEdit(str(PROFIT_TRAIL_DISTANCE_MULT))
-        self.inp_trail.setFixedWidth(36)
-        self.inp_trail.setToolTip("Post-TP1 trailing SL distance in ATR multiples (0.8)")
-        row3.addWidget(self.inp_trail)
-        lbl = QLabel("x ATR"); lbl.setStyleSheet(_u); row3.addWidget(lbl)
-
-        sep_v3 = QFrame(); sep_v3.setFrameShape(QFrame.Shape.VLine)
-        sep_v3.setStyleSheet("color: #3A352B;"); row3.addWidget(sep_v3)
-
-        self.lbl_v4_active = QLabel("V4: Waiting...")
-        self.lbl_v4_active.setStyleSheet("font-weight: bold; font-size: 12px; color: #6B6355;")
-        row3.addWidget(self.lbl_v4_active)
-
-        row3.addStretch()
-        settings_main.addLayout(row3)
-
-        # Live-update V4 params when any field changes
-        for inp in (self.inp_tp1, self.inp_tp2, self.inp_tp3,
-                    self.inp_be_trigger, self.inp_be_buffer,
-                    self.inp_micro_tp, self.inp_micro_pct,
-                    self.inp_stall, self.inp_trail):
-            inp.editingFinished.connect(self._push_v4_params)
-
-        main_layout.addWidget(settings_group)
-
-        # --- Pairs ---
-        pairs_group = QGroupBox("Trading Pairs")
-        pairs_layout = QHBoxLayout(pairs_group)
-        self.pair_checks = {}
-        for sym in ALL_PAIRS:
-            cb = QCheckBox(sym)
-            cb.setChecked(True)
-            self.pair_checks[sym] = cb
-            pairs_layout.addWidget(cb)
-        pairs_layout.addStretch()
-        main_layout.addWidget(pairs_group)
-
-        # --- Charts (QTabWidget with lightweight-charts) ---
-        self.chart_tabs = QTabWidget()
-        self.chart_tabs.setMinimumHeight(350)
-        self.chart_objects = {}       # {symbol: QtChart}
-        self.chart_lines = {}         # {symbol: trailing_stop Line}
-        self.chart_sl_lines = {}      # {symbol: list of HorizontalLine}
-        self._chart_loaded = {}       # {symbol: bool}
-
-        for sym in ALL_PAIRS:
-            chart = QtChart(self)
-            chart.legend(visible=True, font_size=12)
-            chart.layout(
-                background_color="#1A1815",
-                text_color="#B5AFA5",
-                font_size=12,
-                font_family="Georgia",
-            )
-            chart.candle_style(
-                up_color="#4A8C5D", down_color="#C15F3C",
-                wick_up_color="#4A8C5D", wick_down_color="#C15F3C",
-            )
-            chart.volume_config(up_color="rgba(74,140,93,0.3)", down_color="rgba(193,95,60,0.3)")
-            chart.crosshair(mode="normal")
-            chart.grid(vert_enabled=True, horz_enabled=True)
-            chart.time_scale(right_offset=5)
-
-            # ZP trailing stop lines — two colors for bull/bear
-            zp_bull = chart.create_line(name="ZP Bull", color="#4ADE80", width=2, price_label=True)
-            zp_bear = chart.create_line(name="ZP Bear", color="#F87171", width=2, price_label=True)
-            self.chart_lines[sym] = (zp_bull, zp_bear)
-            self.chart_objects[sym] = chart
-            self._chart_loaded[sym] = False
-
-            self.chart_tabs.addTab(chart.get_webview(), sym)
-
-        main_layout.addWidget(self.chart_tabs, stretch=5)
-
-        # --- Compact log at bottom ---
-        self.txt_log = QTextEdit()
-        self.txt_log.setReadOnly(True)
-        self.txt_log.setMaximumHeight(90)
-        self.txt_log.setPlaceholderText("Trade log...")
-        main_layout.addWidget(self.txt_log)
-
-        # --- Hidden positions table (lives in popup dialog) ---
-        self.tbl_positions = None  # created in dialog
-
-    # ── Timeframe change ──
-
-    def _on_tf_changed(self, _index):
-        """Reset charts and restart scanner when timeframe changes."""
-        tf_key = self.combo_tf.currentData()
-        self._log(f"Timeframe changed to {tf_key}")
-
-        # Reset all chart loaded flags so they fully reload
-        for sym in ALL_PAIRS:
-            self._chart_loaded[sym] = False
-
-        # Clear cached chart data
-        self._chart_data.clear()
-
-        # If scanner is running, restart with new TF
-        if self._running and self._scanner:
-            self._scanner.stop()
-            self._scanner = None
-
-            symbols = [s for s, cb in self.pair_checks.items() if cb.isChecked()]
-            poll = int(self.inp_poll.text() or "30")
-            risk = float(self.inp_risk.text() or "30") / 100
-            lots = float(self.inp_lots.text() or "0.40")
-            max_trades = int(self.inp_max_trades.text() or "5")
-
-            self._scanner = ScanEngine()
-            self._scanner._auto_trade = self._trading_enabled
-            self._scanner.log_message.connect(self._on_scanner_log)
-            self._scanner.signal_detected.connect(self._on_signal)
-            self._scanner.scan_complete.connect(self._on_scan_data)
-            self._push_v4_params()
-            self._scanner.start_scanning(symbols, tf_key, poll, risk, lots, max_trades)
+    def _get_full_state(self):
+        """Return JSON-serializable dict of all app state."""
+        return {
+            "settings": dict(self._settings),
+            "scannerRunning": self._running,
+            "tradingEnabled": self._trading_enabled,
+        }
 
     # ── MT5 check ──
 
@@ -1516,40 +1170,39 @@ class ACiApp(QMainWindow):
         try:
             if not mt5.initialize():
                 self._log("MT5 not connected. Please start MetaTrader 5.")
-                self.lbl_mt5.setText("MT5: OFFLINE")
+                self._push_to_js("updateMT5Status(false, '')")
                 return False
             acct = mt5.account_info()
             if acct is None:
                 self._log("MT5: Cannot read account info")
                 return False
-            self.lbl_mt5.setText(f"MT5: {acct.login}")
-            self.lbl_balance.setText(f"Bal: ${acct.balance:.2f}")
             self._starting_balance = acct.balance
+            self._push_to_js(f"updateMT5Status(true, '{acct.login}')")
             self._log(f"MT5 connected: Account {acct.login} | ${acct.balance:.2f}")
             return True
         except Exception as e:
             self._log(f"MT5 error: {e}")
-            self.lbl_mt5.setText("MT5: ERROR")
+            self._push_to_js("updateMT5Status(false, '')")
             return False
 
     # ── V4 Params ──
 
     def _get_v4_params(self):
-        """Read V4 profit capture parameters from UI input fields."""
+        """Read V4 profit capture parameters from settings dict."""
+        s = self._settings
         try:
             return {
-                "tp1_mult": float(self.inp_tp1.text() or TP1_MULT_AGG),
-                "tp2_mult": float(self.inp_tp2.text() or TP2_MULT_AGG),
-                "tp3_mult": float(self.inp_tp3.text() or TP3_MULT_AGG),
-                "be_trigger": float(self.inp_be_trigger.text() or BE_TRIGGER_MULT),
-                "be_buffer": float(self.inp_be_buffer.text() or BE_BUFFER_MULT),
-                "micro_tp": float(self.inp_micro_tp.text() or MICRO_TP_MULT),
-                "micro_pct": float(self.inp_micro_pct.text() or str(MICRO_TP_PCT * 100)) / 100,
-                "stall_bars": int(self.inp_stall.text() or STALL_BARS),
-                "trail_dist": float(self.inp_trail.text() or PROFIT_TRAIL_DISTANCE_MULT),
+                "tp1_mult": float(s.get("v4_tp1", TP1_MULT_AGG)),
+                "tp2_mult": float(s.get("v4_tp2", TP2_MULT_AGG)),
+                "tp3_mult": float(s.get("v4_tp3", TP3_MULT_AGG)),
+                "be_trigger": float(s.get("v4_be_trigger", BE_TRIGGER_MULT)),
+                "be_buffer": float(s.get("v4_be_buffer", BE_BUFFER_MULT)),
+                "micro_tp": float(s.get("v4_micro_tp", MICRO_TP_MULT)),
+                "micro_pct": float(s.get("v4_micro_pct", str(MICRO_TP_PCT * 100))) / 100,
+                "stall_bars": int(float(s.get("v4_stall", STALL_BARS))),
+                "trail_dist": float(s.get("v4_trail", PROFIT_TRAIL_DISTANCE_MULT)),
             }
         except (ValueError, AttributeError):
-            # Fallback to module defaults if UI parse fails
             return {
                 "tp1_mult": TP1_MULT_AGG, "tp2_mult": TP2_MULT_AGG, "tp3_mult": TP3_MULT_AGG,
                 "be_trigger": BE_TRIGGER_MULT, "be_buffer": BE_BUFFER_MULT,
@@ -1558,11 +1211,31 @@ class ACiApp(QMainWindow):
             }
 
     def _push_v4_params(self):
-        """Push current V4 params from UI to scanner and TPManager."""
+        """Push current V4 params to scanner and TPManager."""
         v4 = self._get_v4_params()
         if self._scanner:
             self._scanner.set_v4_params(v4)
         self._tp_manager.set_v4_params(v4)
+
+    # ── Apply Settings from JS ──
+
+    def _apply_settings(self, settings):
+        """Apply settings dict received from JS bridge."""
+        self._settings.update(settings)
+        self._push_v4_params()
+        self._save_settings()
+        self._log("Settings updated from UI")
+
+        # If scanner is running and TF changed, restart it
+        new_tf = settings.get("timeframe")
+        if new_tf and self._running and self._scanner:
+            old_tf = self._settings.get("_active_tf")
+            if old_tf and old_tf != new_tf:
+                self._log(f"Timeframe changed to {new_tf} — restarting scanner")
+                self._on_stop()
+                self._on_start()
+        if new_tf:
+            self._settings["_active_tf"] = new_tf
 
     # ── Start/Stop ──
 
@@ -1574,30 +1247,29 @@ class ACiApp(QMainWindow):
             self._log("Cannot start — MT5 not connected")
             return
 
-        symbols = [s for s, cb in self.pair_checks.items() if cb.isChecked()]
+        pairs = self._settings.get("pairs", {})
+        symbols = [s for s in ALL_PAIRS if pairs.get(s, True)]
         if not symbols:
             self._log("No pairs selected!")
             return
 
-        tf_key = self.combo_tf.currentData()
-        poll = int(self.inp_poll.text() or "30")
-        risk = float(self.inp_risk.text() or "30") / 100
-        lots = float(self.inp_lots.text() or "0.40")
-        max_trades = int(self.inp_max_trades.text() or "5")
+        tf_key = self._settings.get("timeframe", "H4")
+        poll = int(self._settings.get("poll_sec", "30") or "30")
+        risk = float(self._settings.get("risk", "30") or "30") / 100
+        lots = float(self._settings.get("lots", "0.40") or "0.40")
+        max_trades = int(self._settings.get("max_trades", "5") or "5")
 
         self._scanner = ScanEngine()
         self._scanner._auto_trade = self._trading_enabled
         self._scanner.log_message.connect(self._on_scanner_log)
         self._scanner.signal_detected.connect(self._on_signal)
         self._scanner.scan_complete.connect(self._on_scan_data)
-        # Push V4 params from UI to scanner + TP manager
         self._push_v4_params()
         self._scanner.start_scanning(symbols, tf_key, poll, risk, lots, max_trades)
 
         self._running = True
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.lbl_scanner.setText("Scanner: RUNNING")
+        self._settings["_active_tf"] = tf_key
+        self._push_to_js(f"updateScannerState(true, {json.dumps(self._trading_enabled)})")
         self._save_settings()
 
     def _on_stop(self):
@@ -1605,31 +1277,24 @@ class ACiApp(QMainWindow):
             self._scanner.stop()
             self._scanner = None
         self._running = False
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        self.lbl_scanner.setText("Scanner: OFF")
+        self._push_to_js(f"updateScannerState(false, {json.dumps(self._trading_enabled)})")
 
     # ── Trade toggle ──
 
     def _toggle_trading(self):
         self._trading_enabled = not self._trading_enabled
         if self._trading_enabled:
-            self.btn_trade.setText("Trade: ON")
-            self.btn_trade.setStyleSheet(
-                "background-color: #4A8C5D; border: none; color: #FFFFFF; "
-                "font-weight: bold; border-radius: 8px; padding: 8px 20px; min-height: 28px;")
             self._log("TRADING ENABLED — signals will auto-execute")
         else:
-            self.btn_trade.setText("Trade: OFF")
-            self.btn_trade.setStyleSheet("")  # reset to theme default
             self._log("TRADING DISABLED — scan-only mode")
 
         # Update scanner's auto-trade flag
         if self._scanner:
             self._scanner._auto_trade = self._trading_enabled
             if self._trading_enabled:
-                # Clear entered signals so it picks up recent signals on next scan
                 self._scanner._entered_signals.clear()
+
+        self._push_to_js(f"updateTradingState({json.dumps(self._trading_enabled)})")
 
     # ── Scanner signal handlers ──
 
@@ -1646,43 +1311,18 @@ class ACiApp(QMainWindow):
                   f"R:R={rr:.2f} BE@{be_price:.5f} ATR={atr:.5f} ***")
 
         # Register with V4 TP Manager if trading is enabled
-        # Find the matching open position ticket (delay 3s for MT5 to register)
         if self._trading_enabled:
             QTimer.singleShot(3000, lambda: self._register_trade_for_tp(
                 symbol, direction, entry, sl, tp1, tp2, tp3, atr))
 
-        # Draw V4 levels on chart (Entry, SL, BE trigger, Micro-TP, TP1, TP2, TP3)
-        if symbol in self.chart_objects:
-            chart = self.chart_objects[symbol]
-            try:
-                # Clear old level lines
-                for old_line in self.chart_sl_lines.get(symbol, []):
-                    try:
-                        old_line.delete()
-                    except Exception:
-                        pass
-
-                # Calculate V4 levels from UI settings
-                sign = 1 if direction == "BUY" else -1
-                micro_level = entry + sign * v4["micro_tp"] * atr
-                be_level = entry + sign * v4["be_trigger"] * atr
-
-                lines = []
-                lines.append(chart.horizontal_line(entry, color="#FFFFFF", width=1, style="dashed",
-                             text=f"ENTRY {entry:.5f}"))
-                lines.append(chart.horizontal_line(sl, color="#F87171", width=2, style="solid",
-                             text=f"SL {sl:.5f}"))
-                lines.append(chart.horizontal_line(be_level, color="#FBBF24", width=1, style="dashed",
-                             text=f"BE Trigger {be_level:.5f}"))
-                lines.append(chart.horizontal_line(tp1, color="#4ADE80", width=1, style="dashed",
-                             text=f"TP1 {tp1:.5f} ({v4['tp1_mult']}x ATR)"))
-                lines.append(chart.horizontal_line(tp2, color="#38BDF8", width=1, style="dashed",
-                             text=f"TP2 {tp2:.5f} ({v4['tp2_mult']}x ATR)"))
-                lines.append(chart.horizontal_line(tp3, color="#A78BFA", width=1, style="dashed",
-                             text=f"TP3 {tp3:.5f} ({v4['tp3_mult']}x ATR)"))
-                self.chart_sl_lines[symbol] = lines
-            except Exception as e:
-                self._log(f"[{symbol}] Level draw error: {e}")
+        # Push signal levels to JS chart
+        levels = {
+            "direction": direction,
+            "entry": entry, "sl": sl,
+            "be": be_price,
+            "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        }
+        self._push_to_js(f"updateSignalLevels('{symbol}', {json.dumps(levels)})")
 
     def _register_trade_for_tp(self, symbol, direction, entry, sl, tp1, tp2, tp3, atr_val):
         """Find the just-placed trade ticket and register it with V4 TP manager."""
@@ -1694,7 +1334,6 @@ class ACiApp(QMainWindow):
             for pos in positions:
                 pos_norm = pos.symbol.upper().replace(".", "").replace("#", "")
                 if pos_norm == norm and pos.magic == MAGIC_NUMBER:
-                    # Check it's not already tracked
                     if pos.ticket not in self._tp_manager._trade_info:
                         self._tp_manager.register_trade(
                             pos.ticket, direction, entry, sl, tp1, tp2, tp3, atr_val, pos.volume)
@@ -1702,269 +1341,106 @@ class ACiApp(QMainWindow):
         except Exception as e:
             self._log(f"TP registration error: {e}")
 
-    # ── Positions Dialog ──
-
-    def _show_positions_dialog(self):
-        """Open a popup window showing open positions + trade history."""
-        if self._positions_dialog and self._positions_dialog.isVisible():
-            self._positions_dialog.raise_()
-            self._positions_dialog.activateWindow()
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("ACi V4 — Positions & Trade Management")
-        dlg.resize(900, 600)
-        dlg.setStyleSheet(DARK_STYLE if self._dark_mode else CLAUDE_STYLE)
-        layout = QVBoxLayout(dlg)
-
-        # --- Account summary at top ---
-        acct_row = QHBoxLayout()
-        self._dlg_lbl_acct = QLabel("Account: --")
-        self._dlg_lbl_acct.setStyleSheet("font-weight: bold; font-size: 14px;")
-        acct_row.addWidget(self._dlg_lbl_acct)
-        acct_row.addStretch()
-        self._dlg_lbl_pnl = QLabel("Open P/L: $0.00")
-        self._dlg_lbl_pnl.setStyleSheet("font-weight: bold; font-size: 14px;")
-        acct_row.addWidget(self._dlg_lbl_pnl)
-        layout.addLayout(acct_row)
-
-        # --- Open positions table ---
-        layout.addWidget(QLabel("Open Positions  —  V4 Profit Capture"))
-        self._dlg_tbl_open = QTableWidget(0, 11)
-        self._dlg_tbl_open.setHorizontalHeaderLabels(
-            ["Symbol", "Dir", "Lots", "Entry", "Current", "P/L", "SL", "TP",
-             "V4 Layers", "Trail SL", "Peak"])
-        self._dlg_tbl_open.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self._dlg_tbl_open.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._dlg_tbl_open.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        layout.addWidget(self._dlg_tbl_open)
-
-        # --- Closed history table ---
-        layout.addWidget(QLabel("Recent Trade History (today)"))
-        self._dlg_tbl_history = QTableWidget(0, 8)
-        self._dlg_tbl_history.setHorizontalHeaderLabels(
-            ["Symbol", "Dir", "Lots", "Entry", "Close", "P/L", "Commission", "Time"])
-        self._dlg_tbl_history.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self._dlg_tbl_history.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._dlg_tbl_history.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        layout.addWidget(self._dlg_tbl_history)
-
-        self._positions_dialog = dlg
-
-        # Populate immediately
-        self._refresh_positions_dialog()
-
-        # Refresh timer for the dialog
-        self._dlg_timer = QTimer(dlg)
-        self._dlg_timer.timeout.connect(self._refresh_positions_dialog)
-        self._dlg_timer.start(2000)
-
-        dlg.show()
-
-    def _refresh_positions_dialog(self):
-        """Refresh the positions dialog with live data."""
-        if not self._positions_dialog or not self._positions_dialog.isVisible():
-            return
-        try:
-            acct = mt5.account_info()
-            if acct:
-                self._dlg_lbl_acct.setText(
-                    f"Account: {acct.login}  |  Bal: ${acct.balance:.2f}  |  "
-                    f"Eq: ${acct.equity:.2f}  |  Margin: ${acct.margin:.2f}  |  "
-                    f"Free: ${acct.margin_free:.2f}")
-
-            # --- Open positions ---
-            positions = mt5.positions_get()
-            if positions is None:
-                positions = []
-            my_pos = [p for p in positions if p.magic == MAGIC_NUMBER]
-
-            total_pnl = sum(p.profit for p in my_pos)
-            pnl_color = "#4ADE80" if total_pnl >= 0 else "#F87171"
-            self._dlg_lbl_pnl.setText(f"Open P/L: ${total_pnl:.2f}")
-            self._dlg_lbl_pnl.setStyleSheet(
-                f"font-weight: bold; font-size: 14px; color: {pnl_color};")
-
-            self._dlg_tbl_open.setRowCount(len(my_pos))
-            for row, pos in enumerate(my_pos):
-                direction = "BUY" if pos.type == 0 else "SELL"
-                pnl = pos.profit
-                self._dlg_tbl_open.setItem(row, 0, QTableWidgetItem(pos.symbol))
-                dir_item = QTableWidgetItem(direction)
-                dir_item.setForeground(QColor("#4ADE80") if direction == "BUY" else QColor("#F87171"))
-                self._dlg_tbl_open.setItem(row, 1, dir_item)
-                self._dlg_tbl_open.setItem(row, 2, QTableWidgetItem(f"{pos.volume:.2f}"))
-                self._dlg_tbl_open.setItem(row, 3, QTableWidgetItem(f"{pos.price_open:.5f}"))
-                self._dlg_tbl_open.setItem(row, 4, QTableWidgetItem(f"{pos.price_current:.5f}"))
-                pnl_item = QTableWidgetItem(f"${pnl:.2f}")
-                pnl_item.setForeground(QColor("#4ADE80") if pnl >= 0 else QColor("#F87171"))
-                self._dlg_tbl_open.setItem(row, 5, pnl_item)
-                self._dlg_tbl_open.setItem(row, 6, QTableWidgetItem(f"{pos.sl:.5f}"))
-                self._dlg_tbl_open.setItem(row, 7, QTableWidgetItem(f"{pos.tp:.5f}"))
-
-                # V4 Layers status
-                tp_state = self._tp_manager._tp_state.get(pos.ticket, {})
-                if tp_state:
-                    layers = []
-                    if tp_state.get("micro_tp"):
-                        layers.append("uTP")
-                    if tp_state.get("be_activated"):
-                        layers.append("BE")
-                    if tp_state.get("stall_be"):
-                        layers.append("STALL")
-                    if tp_state.get("tp1"):
-                        layers.append("TP1")
-                    if tp_state.get("tp2"):
-                        layers.append("TP2")
-                    if tp_state.get("tp3"):
-                        layers.append("TP3")
-                    if tp_state.get("profit_trail_sl") is not None:
-                        layers.append("TRAIL")
-                    layer_text = " ".join(layers) if layers else "---"
-                else:
-                    layer_text = "untracked"
-                layer_item = QTableWidgetItem(layer_text)
-                if "TP1" in layer_text:
-                    layer_item.setForeground(QColor("#4ADE80"))
-                elif "BE" in layer_text:
-                    layer_item.setForeground(QColor("#FBBF24"))
-                else:
-                    layer_item.setForeground(QColor("#B5AFA5"))
-                self._dlg_tbl_open.setItem(row, 8, layer_item)
-
-                # Trail SL
-                trail_sl = tp_state.get("profit_trail_sl") if tp_state else None
-                trail_text = f"{trail_sl:.5f}" if trail_sl is not None else "---"
-                self._dlg_tbl_open.setItem(row, 9, QTableWidgetItem(trail_text))
-
-                # Peak (max favorable price)
-                peak = tp_state.get("max_favorable") if tp_state else None
-                peak_text = f"{peak:.5f}" if peak is not None else "---"
-                self._dlg_tbl_open.setItem(row, 10, QTableWidgetItem(peak_text))
-
-            # --- Trade history (today's deals) ---
-            from datetime import datetime, timedelta
-            now = datetime.now()
-            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-            deals = mt5.history_deals_get(today_start, now)
-            if deals is None:
-                deals = []
-
-            # Filter: only our magic, only out-deals (closes), not deposits/withdrawals
-            close_deals = [d for d in deals
-                           if d.magic == MAGIC_NUMBER
-                           and d.entry == mt5.DEAL_ENTRY_OUT
-                           and d.type in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL)]
-
-            self._dlg_tbl_history.setRowCount(len(close_deals))
-            for row, deal in enumerate(close_deals):
-                direction = "BUY" if deal.type == mt5.DEAL_TYPE_BUY else "SELL"
-                deal_time = datetime.fromtimestamp(deal.time).strftime("%H:%M:%S")
-                self._dlg_tbl_history.setItem(row, 0, QTableWidgetItem(deal.symbol))
-                self._dlg_tbl_history.setItem(row, 1, QTableWidgetItem(direction))
-                self._dlg_tbl_history.setItem(row, 2, QTableWidgetItem(f"{deal.volume:.2f}"))
-                self._dlg_tbl_history.setItem(row, 3, QTableWidgetItem(f"{deal.price:.5f}"))
-                self._dlg_tbl_history.setItem(row, 4, QTableWidgetItem(f"{deal.price:.5f}"))
-                pnl_item = QTableWidgetItem(f"${deal.profit:.2f}")
-                pnl_item.setForeground(QColor("#4ADE80") if deal.profit >= 0 else QColor("#F87171"))
-                self._dlg_tbl_history.setItem(row, 5, pnl_item)
-                self._dlg_tbl_history.setItem(row, 6, QTableWidgetItem(f"${deal.commission:.2f}"))
-                self._dlg_tbl_history.setItem(row, 7, QTableWidgetItem(deal_time))
-
-        except Exception as e:
-            pass
-
     def _on_scan_data(self, symbol, df):
-        """Update lightweight-chart when scan data arrives."""
+        """Serialize scan DataFrame and push chart data to JS."""
         self._chart_data[symbol] = df
 
-        if symbol not in self.chart_objects:
-            return
-
-        chart = self.chart_objects[symbol]
-        zp_lines = self.chart_lines.get(symbol)  # (bull_line, bear_line)
-
         try:
-            # Prepare OHLCV for chart
-            chart_df = df[["time", "open", "high", "low", "close", "volume"]].copy()
+            # Prepare OHLCV as JSON-serializable list
+            ohlcv = []
+            for _, row in df.iterrows():
+                t = row["time"]
+                # Convert pandas Timestamp to unix seconds
+                if hasattr(t, "timestamp"):
+                    ts = int(t.timestamp())
+                else:
+                    ts = int(t)
+                ohlcv.append({
+                    "time": ts,
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row.get("volume", 0) or 0),
+                })
 
-            # Split trailing stop into bull/bear segments by position
-            bull_df = df[["time", "xATRTrailingStop", "pos"]].copy()
-            bear_df = bull_df.copy()
-            bull_df.loc[bull_df["pos"] != 1, "xATRTrailingStop"] = np.nan
-            bear_df.loc[bear_df["pos"] != -1, "xATRTrailingStop"] = np.nan
-            bull_df = bull_df[["time", "xATRTrailingStop"]].rename(columns={"xATRTrailingStop": "ZP Bull"})
-            bear_df = bear_df[["time", "xATRTrailingStop"]].rename(columns={"xATRTrailingStop": "ZP Bear"})
-            bull_df = bull_df.dropna(subset=["ZP Bull"])
-            bear_df = bear_df.dropna(subset=["ZP Bear"])
+            # Split trailing stop into bull/bear
+            bull_data = []
+            bear_data = []
+            for _, row in df.iterrows():
+                t = row["time"]
+                ts = int(t.timestamp()) if hasattr(t, "timestamp") else int(t)
+                zp = row.get("xATRTrailingStop")
+                pos = row.get("pos")
+                if zp is not None and not (isinstance(zp, float) and math.isnan(zp)):
+                    if pos == 1:
+                        bull_data.append({"time": ts, "value": float(zp)})
+                    elif pos == -1:
+                        bear_data.append({"time": ts, "value": float(zp)})
+
+            # Collect markers
+            markers = []
+            for _, row in df.iterrows():
+                t = row["time"]
+                ts = int(t.timestamp()) if hasattr(t, "timestamp") else int(t)
+                if row.get("buy_signal", False):
+                    markers.append({
+                        "time": ts,
+                        "position": "belowBar",
+                        "shape": "arrowUp",
+                        "color": "#4ADE80",
+                        "text": "BUY",
+                    })
+                elif row.get("sell_signal", False):
+                    markers.append({
+                        "time": ts,
+                        "position": "aboveBar",
+                        "shape": "arrowDown",
+                        "color": "#F87171",
+                        "text": "SELL",
+                    })
 
             if not self._chart_loaded.get(symbol, False):
-                # First load — set full historical data
-                chart.set(chart_df)
-                if zp_lines:
-                    zp_bull, zp_bear = zp_lines
-                    if len(bull_df) > 0:
-                        zp_bull.set(bull_df)
-                    if len(bear_df) > 0:
-                        zp_bear.set(bear_df)
-
-                # Add markers only on actual flip signals
-                for idx, row in df.iterrows():
-                    if row.get("buy_signal", False):
-                        chart.marker(
-                            time=row["time"],
-                            position="below",
-                            shape="arrow_up",
-                            color="#4ADE80",
-                            text="BUY",
-                        )
-                    elif row.get("sell_signal", False):
-                        chart.marker(
-                            time=row["time"],
-                            position="above",
-                            shape="arrow_down",
-                            color="#F87171",
-                            text="SELL",
-                        )
-
-                # Fit chart to show all data
-                chart.fit()
+                # Full chart load
+                js = (f"updateChartData('{symbol}',"
+                      f"{json.dumps(ohlcv)},"
+                      f"{json.dumps(bull_data)},"
+                      f"{json.dumps(bear_data)},"
+                      f"{json.dumps(markers)})")
+                self._push_to_js(js)
                 self._chart_loaded[symbol] = True
             else:
-                # Incremental update — update last bar
-                last_row = chart_df.iloc[-1]
-                chart.update(last_row)
+                # Incremental update — last bar only
+                last_bar = ohlcv[-1] if ohlcv else None
+                last_bull = bull_data[-1] if bull_data else None
+                last_bear = bear_data[-1] if bear_data else None
 
-                if zp_lines:
-                    zp_bull, zp_bear = zp_lines
-                    if len(bull_df) > 0:
-                        zp_bull.update(bull_df.iloc[-1])
-                    if len(bear_df) > 0:
-                        zp_bear.update(bear_df.iloc[-1])
-
-                # Check for new signal on confirmed bar
+                # Check for new signal on confirmed bar (second to last)
+                new_markers = []
                 if len(df) > 1:
                     prev = df.iloc[-2]
+                    t = prev["time"]
+                    ts = int(t.timestamp()) if hasattr(t, "timestamp") else int(t)
                     if prev.get("buy_signal", False):
-                        chart.marker(
-                            time=prev["time"],
-                            position="below",
-                            shape="arrow_up",
-                            color="#4ADE80",
-                            text="BUY",
-                        )
+                        new_markers.append({
+                            "time": ts, "position": "belowBar",
+                            "shape": "arrowUp", "color": "#4ADE80", "text": "BUY",
+                        })
                     elif prev.get("sell_signal", False):
-                        chart.marker(
-                            time=prev["time"],
-                            position="above",
-                            shape="arrow_down",
-                            color="#F87171",
-                            text="SELL",
-                        )
+                        new_markers.append({
+                            "time": ts, "position": "aboveBar",
+                            "shape": "arrowDown", "color": "#F87171", "text": "SELL",
+                        })
+
+                js = (f"updateChartIncremental('{symbol}',"
+                      f"{json.dumps(last_bar)},"
+                      f"{json.dumps(last_bull)},"
+                      f"{json.dumps(last_bear)},"
+                      f"{json.dumps(new_markers)})")
+                self._push_to_js(js)
 
         except Exception as e:
-            self._log(f"[{symbol}] Chart update error: {e}")
+            self._log(f"[{symbol}] Chart data push error: {e}")
 
     # ── Logging ──
 
@@ -1975,9 +1451,9 @@ class ACiApp(QMainWindow):
         self._log_signal.emit(full)
 
     def _log_on_main_thread(self, msg):
-        self.txt_log.append(msg)
-        sb = self.txt_log.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        """Push log message to JS UI."""
+        safe = msg.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+        self._push_to_js(f"appendLog('{safe}')")
 
     # ── Live account stats ──
 
@@ -1996,49 +1472,437 @@ class ACiApp(QMainWindow):
             margin = acct.margin
             free_margin = acct.margin_free
 
-            # Store starting balance on first connect
             if self._starting_balance is None:
                 self._starting_balance = balance
 
-            # Update labels
-            self.lbl_balance.setText(f"Bal: ${balance:.2f}")
-
-            eq_color = "#4ADE80" if equity >= balance else "#F87171"
-            self.lbl_equity.setText(f"Eq: ${equity:.2f}")
-            self.lbl_equity.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {eq_color};")
-
-            self.lbl_margin.setText(f"Margin: ${margin:.2f}")
-            self.lbl_free_margin.setText(f"Free: ${free_margin:.2f}")
-
-            # Growth % from starting balance
-            if self._starting_balance > 0:
+            # Growth %
+            growth = 0.0
+            if self._starting_balance and self._starting_balance > 0:
                 growth = ((equity - self._starting_balance) / self._starting_balance) * 100
-                g_color = "#4ADE80" if growth >= 0 else "#F87171"
-                sign = "+" if growth >= 0 else ""
-                self.lbl_growth.setText(f"Growth: {sign}{growth:.2f}%")
-                self.lbl_growth.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {g_color};")
 
-            # Update V4 manager active trade count
+            # Margin level
+            margin_level = 0.0
+            if margin > 0:
+                margin_level = (equity / margin) * 100
+
+            # Push account info to JS
+            acct_data = {
+                "balance": balance,
+                "equity": equity,
+                "margin": margin,
+                "freeMargin": free_margin,
+                "growth": growth,
+                "marginLevel": margin_level,
+            }
+            self._push_to_js(f"updateAccountInfo({json.dumps(acct_data)})")
+
+            # V4 manager status
             managed = len(self._tp_manager._trade_info)
             be_count = sum(1 for s in self._tp_manager._tp_state.values() if s.get("be_activated"))
             tp1_count = sum(1 for s in self._tp_manager._tp_state.values() if s.get("tp1"))
-            trail_count = sum(1 for s in self._tp_manager._tp_state.values() if s.get("profit_trail_sl") is not None)
-            if managed > 0:
-                parts = [f"{managed} managed"]
-                if be_count:
-                    parts.append(f"{be_count} BE")
-                if tp1_count:
-                    parts.append(f"{tp1_count} TP1")
-                if trail_count:
-                    parts.append(f"{trail_count} trailing")
-                self.lbl_v4_active.setText("V4: " + " | ".join(parts))
-                self.lbl_v4_active.setStyleSheet("font-weight: bold; font-size: 12px; color: #4ADE80;")
-            else:
-                self.lbl_v4_active.setText("V4: Waiting for trades...")
-                self.lbl_v4_active.setStyleSheet("font-weight: bold; font-size: 12px; color: #6B6355;")
+            trail_count = sum(1 for s in self._tp_manager._tp_state.values()
+                              if s.get("profit_trail_sl") is not None)
+            micro_count = sum(1 for s in self._tp_manager._tp_state.values() if s.get("micro_tp"))
+
+            v4_data = {
+                "managed": managed,
+                "be": be_count,
+                "tp1": tp1_count,
+                "trail": trail_count,
+                "micro": micro_count,
+            }
+            self._push_to_js(f"updateV4Status({json.dumps(v4_data)})")
+
+            # Push positions data to JS
+            self._push_positions()
 
         except Exception:
             pass
+
+    def _push_positions(self):
+        """Push open positions + trade history to JS."""
+        try:
+            positions = mt5.positions_get()
+            if positions is None:
+                positions = []
+            my_pos = [p for p in positions if p.magic == MAGIC_NUMBER]
+
+            open_list = []
+            for pos in my_pos:
+                direction = "BUY" if pos.type == 0 else "SELL"
+                tp_state = self._tp_manager._tp_state.get(pos.ticket, {})
+                open_list.append({
+                    "symbol": pos.symbol,
+                    "direction": direction,
+                    "lots": pos.volume,
+                    "entry": pos.price_open,
+                    "current": pos.price_current,
+                    "pl": pos.profit,
+                    "sl": pos.sl,
+                    "tp": pos.tp,
+                    "micro_tp": tp_state.get("micro_tp", False),
+                    "be_activated": tp_state.get("be_activated", False),
+                    "stall_be": tp_state.get("stall_be", False),
+                    "tp1": tp_state.get("tp1", False),
+                    "tp2": tp_state.get("tp2", False),
+                    "profit_trail_sl": tp_state.get("profit_trail_sl") is not None,
+                    "peak": tp_state.get("max_favorable"),
+                })
+
+            # Trade history (today)
+            now = datetime.now()
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            deals = mt5.history_deals_get(today_start, now)
+            if deals is None:
+                deals = []
+
+            close_deals = [d for d in deals
+                           if d.magic == MAGIC_NUMBER
+                           and d.entry == mt5.DEAL_ENTRY_OUT
+                           and d.type in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL)]
+
+            history_list = []
+            for deal in close_deals:
+                direction = "BUY" if deal.type == mt5.DEAL_TYPE_BUY else "SELL"
+                deal_time = datetime.fromtimestamp(deal.time).strftime("%H:%M:%S")
+                history_list.append({
+                    "symbol": deal.symbol,
+                    "direction": direction,
+                    "lots": deal.volume,
+                    "entry": deal.price,
+                    "close": deal.price,
+                    "pl": deal.profit,
+                    "time": deal_time,
+                })
+
+            pos_data = {"open": open_list, "history": history_list}
+            self._push_to_js(f"updatePositions({json.dumps(pos_data)})")
+
+        except Exception:
+            pass
+
+    # ── Portfolio Equity Curve ──
+
+    def _push_portfolio(self):
+        """Fetch full deal history from MT5 and push equity curve + stats + pair breakdown to JS."""
+        try:
+            # Fetch ALL deals from the last 90 days (covers most trading history)
+            from datetime import timedelta
+            from collections import defaultdict
+            now = datetime.now()
+            start = now - timedelta(days=90)
+            deals = mt5.history_deals_get(start, now)
+            if deals is None:
+                deals = []
+
+            # Filter to our magic number close deals (entry_out = profit/loss realized)
+            close_deals = [d for d in deals
+                           if d.magic == MAGIC_NUMBER
+                           and d.entry == mt5.DEAL_ENTRY_OUT
+                           and d.type in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL)]
+
+            if not close_deals:
+                # No history — push empty
+                self._push_to_js("updatePortfolio([], {})")
+                self._push_to_js("updatePortfolioPairs([])")
+                return
+
+            # Sort by time
+            close_deals.sort(key=lambda d: d.time)
+
+            # Build cumulative equity curve
+            acct = mt5.account_info()
+            current_balance = acct.balance if acct else 0
+            total_pnl = sum(d.profit + d.commission + d.swap for d in close_deals)
+            starting_eq = current_balance - total_pnl
+
+            curve = []
+            running = starting_eq
+            wins = 0
+            losses = 0
+            gross_profit = 0.0
+            gross_loss = 0.0
+            win_amounts = []
+            loss_amounts = []
+
+            # Per-day P/L tracking
+            daily_pnl = defaultdict(float)
+            # Per-symbol tracking
+            symbol_stats = defaultdict(lambda: {"wins": 0, "losses": 0, "gross_profit": 0.0, "gross_loss": 0.0, "pnls": []})
+            # Win streak tracking
+            current_streak = 0
+            max_streak = 0
+
+            for deal in close_deals:
+                pnl = deal.profit + deal.commission + deal.swap
+                running += pnl
+                ts = int(deal.time)  # unix seconds
+                curve.append({"time": ts, "value": round(running, 2)})
+
+                # Day key for daily P/L
+                deal_date = datetime.fromtimestamp(deal.time).strftime("%Y-%m-%d")
+                daily_pnl[deal_date] += pnl
+
+                # Symbol breakdown
+                sym = deal.symbol.upper().replace(".", "").replace("#", "")
+                # Normalize to 6-char base (e.g., EURUSDm -> EURUSD)
+                for base in ALL_PAIRS:
+                    if sym.startswith(base):
+                        sym = base
+                        break
+                ss = symbol_stats[sym]
+                ss["pnls"].append(pnl)
+
+                if pnl >= 0:
+                    wins += 1
+                    gross_profit += pnl
+                    win_amounts.append(pnl)
+                    ss["wins"] += 1
+                    ss["gross_profit"] += pnl
+                    current_streak += 1
+                    max_streak = max(max_streak, current_streak)
+                else:
+                    losses += 1
+                    gross_loss += abs(pnl)
+                    loss_amounts.append(pnl)
+                    ss["losses"] += 1
+                    ss["gross_loss"] += abs(pnl)
+                    current_streak = 0
+
+            # Add current equity as last point
+            if acct:
+                curve.append({"time": int(now.timestamp()), "value": round(acct.equity, 2)})
+
+            total = wins + losses
+            win_rate = (wins / total * 100) if total > 0 else 0
+            pf = (gross_profit / gross_loss) if gross_loss > 0 else 999.0
+            net = gross_profit - gross_loss
+            avg_trade = net / total if total > 0 else 0
+            avg_win = sum(win_amounts) / len(win_amounts) if win_amounts else 0
+            avg_loss = sum(loss_amounts) / len(loss_amounts) if loss_amounts else 0
+
+            # Best/worst day
+            best_day = max(daily_pnl.values()) if daily_pnl else None
+            worst_day = min(daily_pnl.values()) if daily_pnl else None
+
+            # Best pair by net profit
+            best_pair = ""
+            best_pair_net = -float("inf")
+            for sym, ss in symbol_stats.items():
+                sym_net = ss["gross_profit"] - ss["gross_loss"]
+                if sym_net > best_pair_net:
+                    best_pair_net = sym_net
+                    best_pair = sym
+
+            # Growth %
+            equity = acct.equity if acct else 0
+            growth_pct = 0.0
+            if starting_eq > 0:
+                growth_pct = ((equity - starting_eq) / starting_eq) * 100
+
+            stats = {
+                "totalTrades": total,
+                "wins": wins,
+                "losses": losses,
+                "winRate": round(win_rate, 1),
+                "profitFactor": round(pf, 2),
+                "netProfit": round(net, 2),
+                "grossProfit": round(gross_profit, 2),
+                "grossLoss": round(gross_loss, 2),
+                "avgTrade": round(avg_trade, 2),
+                "avgWin": round(avg_win, 2) if win_amounts else None,
+                "avgLoss": round(avg_loss, 2) if loss_amounts else None,
+                "bestDay": round(best_day, 2) if best_day is not None else None,
+                "worstDay": round(worst_day, 2) if worst_day is not None else None,
+                "winStreak": max_streak,
+                "bestPair": best_pair,
+                "netWorth": round(equity, 2),
+                "growthPct": round(growth_pct, 2),
+            }
+
+            self._push_to_js(f"updatePortfolio({json.dumps(curve)}, {json.dumps(stats)})")
+
+            # ── Pair breakdown for Portfolio table ──
+            pair_list = []
+            for sym, ss in symbol_stats.items():
+                sym_total = ss["wins"] + ss["losses"]
+                sym_wr = (ss["wins"] / sym_total * 100) if sym_total > 0 else 0
+                sym_net = ss["gross_profit"] - ss["gross_loss"]
+                sym_avg = sym_net / sym_total if sym_total > 0 else 0
+                sym_pf = (ss["gross_profit"] / ss["gross_loss"]) if ss["gross_loss"] > 0 else 999.0
+                pair_list.append({
+                    "symbol": sym,
+                    "trades": sym_total,
+                    "winRate": round(sym_wr, 1),
+                    "net": round(sym_net, 2),
+                    "avg": round(sym_avg, 2),
+                    "pf": round(sym_pf, 2),
+                })
+
+            # Sort by net profit descending
+            pair_list.sort(key=lambda x: x["net"], reverse=True)
+
+            self._push_to_js(f"updatePortfolioPairs({json.dumps(pair_list)})")
+
+        except Exception as e:
+            log.warning(f"Portfolio push error: {e}")
+
+    # ── Dashboard Market News + Sentiment ──
+
+    def _fetch_and_push_news(self):
+        """Fetch forex news headlines and USD sentiment in background thread."""
+        def _worker():
+            try:
+                import urllib.request
+                import xml.etree.ElementTree as ET
+
+                news_items = []
+                now = datetime.now()
+
+                # ── Fetch ForexFactory calendar RSS (forex news) ──
+                try:
+                    req = urllib.request.Request(
+                        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                        headers={"User-Agent": "Mozilla/5.0"}
+                    )
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        cal_data = json.loads(resp.read().decode("utf-8"))
+
+                    # Filter to USD and high/medium impact, recent or upcoming
+                    for evt in cal_data:
+                        currency = evt.get("country", "")
+                        impact = evt.get("impact", "").lower()
+                        title = evt.get("title", "")
+                        date_str = evt.get("date", "")
+
+                        if not title:
+                            continue
+
+                        # Parse event date
+                        try:
+                            evt_dt = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S%z")
+                            evt_naive = evt_dt.replace(tzinfo=None)
+                        except Exception:
+                            evt_naive = now
+
+                        diff = (now - evt_naive).total_seconds()
+                        # Show events from past 24h and upcoming 24h
+                        if diff > 86400 or diff < -86400:
+                            continue
+
+                        if diff > 0:
+                            hours = diff / 3600
+                            if hours < 1:
+                                time_ago = f"{int(diff/60)}m ago"
+                            else:
+                                time_ago = f"{int(hours)}h ago"
+                        else:
+                            hours = abs(diff) / 3600
+                            if hours < 1:
+                                time_ago = f"in {int(abs(diff)/60)}m"
+                            else:
+                                time_ago = f"in {int(hours)}h"
+
+                        # Add forecast/actual if available
+                        forecast = evt.get("forecast", "")
+                        actual = evt.get("actual", "")
+                        if actual:
+                            title += f" — Actual: {actual}"
+                            if forecast:
+                                title += f" (Fcst: {forecast})"
+                        elif forecast:
+                            title += f" — Fcst: {forecast}"
+
+                        news_items.append({
+                            "title": title,
+                            "currency": currency.upper(),
+                            "impact": impact,
+                            "timeAgo": time_ago,
+                            "sort": diff,
+                        })
+
+                except Exception as e:
+                    log.warning(f"Calendar fetch error: {e}")
+
+                # Sort: upcoming first (negative diff), then most recent
+                news_items.sort(key=lambda x: x.get("sort", 0))
+                # Limit to 20 items
+                news_items = news_items[:20]
+
+                # ── Fetch DXY from MT5 ──
+                dxy_val = None
+                dxy_change = None
+                try:
+                    # Try common DXY symbol names on broker
+                    for dxy_sym in ["USDX", "DXY", "DX", "USDX.raw", "DXY.raw"]:
+                        info = mt5.symbol_info(dxy_sym)
+                        if info is not None:
+                            mt5.symbol_select(dxy_sym, True)
+                            tick = mt5.symbol_info_tick(dxy_sym)
+                            if tick:
+                                dxy_val = tick.bid
+                            # Get daily change from OHLC
+                            rates = mt5.copy_rates_from_pos(dxy_sym, mt5.TIMEFRAME_D1, 0, 2)
+                            if rates is not None and len(rates) >= 2:
+                                prev_close = rates[-2][4]  # close
+                                if prev_close > 0:
+                                    dxy_change = ((dxy_val - prev_close) / prev_close) * 100
+                            break
+                except Exception:
+                    pass
+
+                # ── Build pair sentiment from MT5 position ratios ──
+                # Use our ZP trailing stop direction as a proxy for sentiment
+                sentiment_pairs = []
+                for sym in ALL_PAIRS:
+                    resolved = None
+                    for c in [sym, sym + ".raw", sym + "m"]:
+                        si = mt5.symbol_info(c)
+                        if si is not None:
+                            resolved = c
+                            break
+                    if not resolved:
+                        continue
+
+                    si = mt5.symbol_info(resolved)
+                    if not si:
+                        continue
+                    price = f"{si.bid:.5f}" if "JPY" not in sym else f"{si.bid:.3f}"
+
+                    # Get session stats for sentiment approximation
+                    rates = mt5.copy_rates_from_pos(resolved, mt5.TIMEFRAME_H4, 0, 6)
+                    if rates is not None and len(rates) >= 6:
+                        # Count bullish vs bearish H4 bars as sentiment proxy
+                        bulls = sum(1 for r in rates if r[4] > r[1])  # close > open
+                        bears = len(rates) - bulls
+                        total = bulls + bears
+                        long_pct = (bulls / total * 100) if total > 0 else 50
+                    else:
+                        long_pct = 50
+
+                    sentiment_pairs.append({
+                        "symbol": sym,
+                        "long": round(long_pct),
+                        "price": price,
+                    })
+
+                # Marshal to main thread via signal (can't call runJavaScript from bg thread)
+                sent_data = {
+                    "dxy": dxy_val,
+                    "dxyChange": dxy_change,
+                    "pairs": sentiment_pairs,
+                }
+                self._news_ready.emit(json.dumps(news_items), json.dumps(sent_data))
+
+            except Exception as e:
+                log.warning(f"News fetch error: {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_news_ready(self, news_json, sentiment_json):
+        """Called on main thread when background news fetch completes."""
+        self._push_to_js(f"updateDashNews({news_json})")
+        self._push_to_js(f"updateDashSentiment({sentiment_json})")
 
     # ── Close All ──
 
@@ -2082,52 +1946,14 @@ class ACiApp(QMainWindow):
         except Exception as e:
             self._log(f"Close all error: {e}")
 
-    # ── Theme toggle ──
-
-    def _toggle_theme(self):
-        self._dark_mode = not self._dark_mode
-        self.setStyleSheet(DARK_STYLE if self._dark_mode else CLAUDE_STYLE)
-        self.btn_theme.setText("Light Mode" if self._dark_mode else "Dark Mode")
-
-        # Update chart themes
-        for sym, chart in self.chart_objects.items():
-            try:
-                if self._dark_mode:
-                    chart.layout(background_color="#1A1815", text_color="#B5AFA5",
-                                font_size=12, font_family="Georgia")
-                else:
-                    chart.layout(background_color="#FAF9F5", text_color="#3D3929",
-                                font_size=12, font_family="Georgia")
-            except Exception:
-                pass
-
-        self._save_settings()
-
     # ── Settings ──
 
     def _save_settings(self):
-        settings = {
-            "dark_mode": self._dark_mode,
-            "risk": self.inp_risk.text(),
-            "lots": self.inp_lots.text(),
-            "max_trades": self.inp_max_trades.text(),
-            "poll_sec": self.inp_poll.text(),
-            "timeframe": self.combo_tf.currentData(),
-            "pairs": {s: cb.isChecked() for s, cb in self.pair_checks.items()},
-            # V4 Profit Capture parameters
-            "v4_tp1": self.inp_tp1.text(),
-            "v4_tp2": self.inp_tp2.text(),
-            "v4_tp3": self.inp_tp3.text(),
-            "v4_be_trigger": self.inp_be_trigger.text(),
-            "v4_be_buffer": self.inp_be_buffer.text(),
-            "v4_micro_tp": self.inp_micro_tp.text(),
-            "v4_micro_pct": self.inp_micro_pct.text(),
-            "v4_stall": self.inp_stall.text(),
-            "v4_trail": self.inp_trail.text(),
-        }
         try:
             with open(SETTINGS_PATH, "w") as f:
-                json.dump(settings, f, indent=2)
+                # Filter out internal keys
+                save = {k: v for k, v in self._settings.items() if not k.startswith("_")}
+                json.dump(save, f, indent=2)
         except Exception:
             pass
 
@@ -2135,39 +1961,7 @@ class ACiApp(QMainWindow):
         try:
             with open(SETTINGS_PATH, "r") as f:
                 s = json.load(f)
-            self.inp_risk.setText(s.get("risk", "30"))
-            self.inp_lots.setText(s.get("lots", "0.40"))
-            self.inp_max_trades.setText(s.get("max_trades", "5"))
-            self.inp_poll.setText(s.get("poll_sec", "30"))
-            saved_tf = s.get("timeframe", "H4")
-            for i in range(self.combo_tf.count()):
-                if self.combo_tf.itemData(i) == saved_tf:
-                    self.combo_tf.setCurrentIndex(i)
-                    break
-            for sym, active in s.get("pairs", {}).items():
-                if sym in self.pair_checks:
-                    self.pair_checks[sym].setChecked(active)
-            if not s.get("dark_mode", True):
-                self._toggle_theme()
-            # V4 Profit Capture parameters
-            if "v4_tp1" in s:
-                self.inp_tp1.setText(s["v4_tp1"])
-            if "v4_tp2" in s:
-                self.inp_tp2.setText(s["v4_tp2"])
-            if "v4_tp3" in s:
-                self.inp_tp3.setText(s["v4_tp3"])
-            if "v4_be_trigger" in s:
-                self.inp_be_trigger.setText(s["v4_be_trigger"])
-            if "v4_be_buffer" in s:
-                self.inp_be_buffer.setText(s["v4_be_buffer"])
-            if "v4_micro_tp" in s:
-                self.inp_micro_tp.setText(s["v4_micro_tp"])
-            if "v4_micro_pct" in s:
-                self.inp_micro_pct.setText(s["v4_micro_pct"])
-            if "v4_stall" in s:
-                self.inp_stall.setText(s["v4_stall"])
-            if "v4_trail" in s:
-                self.inp_trail.setText(s["v4_trail"])
+            self._settings.update(s)
         except FileNotFoundError:
             pass
         except Exception:
