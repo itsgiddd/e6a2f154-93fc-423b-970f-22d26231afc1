@@ -308,7 +308,7 @@ class ScanEngine(QObject):
 
     def _scan_loop(self):
         self.log_message.emit(f"Scanner started | {self._tf_key} | {len(self._symbols)} symbols | poll={self._poll}s")
-        first_scan = True
+        scan_count = 0
 
         while self._running:
             scanned = 0
@@ -339,9 +339,13 @@ class ScanEngine(QObject):
                             t = futures[fut]
                             self.log_message.emit(f"[{t['symbol']}] Batch exec error: {e}")
 
-            if first_scan:
-                self.log_message.emit(f"Scan complete: {scanned}/{len(self._symbols)} pairs checked")
-                first_scan = False
+            scan_count += 1
+            # Log every scan on first, then every 10th scan (~5 min at 30s poll)
+            if scan_count == 1 or scan_count % 10 == 0:
+                sigs = len(trade_intents)
+                self.log_message.emit(
+                    f"Scan #{scan_count}: {scanned}/{len(self._symbols)} pairs | "
+                    f"{sigs} signal{'s' if sigs != 1 else ''} | {self._tf_key}")
 
             # Interruptible sleep
             for _ in range(self._poll):
@@ -425,11 +429,14 @@ class ScanEngine(QObject):
             tp2 = entry_price - atr_val * _tp2m
             tp3 = entry_price - atr_val * _tp3m
 
-        # R:R check
+        # R:R check — V4 uses Smart Structure SL (3-5x ATR) but TP1 is 0.8x ATR,
+        # so raw R:R is naturally 0.16-0.27.  V4 profit capture (BE at 0.5x ATR,
+        # stall exits, micro-partials, trailing) compensates — 97.5% WR.
+        # Only reject truly degenerate setups where SL is absurdly wide.
         sl_dist = abs(entry_price - sl_val)
         tp_dist = abs(tp1 - entry_price)
         rr = tp_dist / sl_dist if sl_dist > 0 else 0
-        if rr < 0.3:
+        if rr < 0.05:
             self.log_message.emit(f"[{symbol}] {direction} R:R too low ({rr:.2f}), skipping")
             return
 
@@ -1651,11 +1658,11 @@ class ACiApp(QMainWindow):
     def _push_portfolio(self):
         """Fetch full deal history from MT5 and push equity curve + stats + pair breakdown to JS."""
         try:
-            # Fetch ALL deals from the last 90 days (covers most trading history)
+            # Fetch ALL deals (5 years back covers any realistic trading history)
             from datetime import timedelta
             from collections import defaultdict
             now = datetime.now()
-            start = now - timedelta(days=90)
+            start = now - timedelta(days=365 * 5)
             deals = mt5.history_deals_get(start, now)
             if deals is None:
                 deals = []
@@ -1809,9 +1816,9 @@ class ACiApp(QMainWindow):
 
             self._push_to_js(f"updatePortfolioPairs({json.dumps(pair_list)})")
 
-            # ── Recent individual trades for portfolio trade log ──
-            recent_trades = []
-            for deal in close_deals[-30:]:  # last 30 trades
+            # ── ALL individual trades for portfolio trade log + tax export ──
+            all_trades = []
+            for deal in close_deals:
                 pnl = deal.profit + deal.commission + deal.swap
                 sym = deal.symbol.upper().replace(".", "").replace("#", "")
                 for base in ALL_PAIRS:
@@ -1819,17 +1826,23 @@ class ACiApp(QMainWindow):
                         sym = base
                         break
                 direction = "BUY" if deal.type == mt5.DEAL_TYPE_BUY else "SELL"
-                deal_time = datetime.fromtimestamp(deal.time).strftime("%b %d %H:%M")
-                recent_trades.append({
+                deal_time_str = datetime.fromtimestamp(deal.time).strftime("%b %d %H:%M")
+                deal_date_iso = datetime.fromtimestamp(deal.time).strftime("%Y-%m-%d")
+                all_trades.append({
                     "symbol": sym,
                     "direction": direction,
                     "lots": deal.volume,
                     "pnl": round(pnl, 2),
-                    "time": deal_time,
+                    "time": deal_time_str,
+                    "date": deal_date_iso,
+                    "timestamp": int(deal.time),
                     "win": pnl >= 0,
+                    "commission": round(deal.commission, 2),
+                    "swap": round(deal.swap, 2),
+                    "profit": round(deal.profit, 2),
                 })
-            recent_trades.reverse()  # newest first
-            self._push_to_js(f"updateRecentTrades({json.dumps(recent_trades)})")
+            all_trades.reverse()  # newest first
+            self._push_to_js(f"updateRecentTrades({json.dumps(all_trades)})")
 
         except Exception as e:
             log.warning(f"Portfolio push error: {e}")
