@@ -25,9 +25,22 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+          pip list | findstr -i "numpy pandas MetaTrader5 PySide6"
+
+      - name: Verify imports before build
+        run: |
+          python -c "import numpy; print('numpy', numpy.__version__)"
+          python -c "import pandas; print('pandas', pandas.__version__)"
+          python -c "import PySide6; print('PySide6 OK')"
 
       - name: Build with PyInstaller
         run: pyinstaller Velocity4.spec --noconfirm
+
+      - name: Verify build output
+        run: |
+          dir dist\Velocity4
+          python -c "import os; files = os.listdir('dist/Velocity4'); numpy_files = [f for f in files if 'numpy' in f.lower()]; print(f'numpy files in dist: {len(numpy_files)}'); [print(f'  {f}') for f in numpy_files[:20]]"
+        shell: pwsh
 
       - name: Zip release
         run: |

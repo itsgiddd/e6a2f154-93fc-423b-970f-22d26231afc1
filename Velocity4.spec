@@ -8,11 +8,17 @@ Usage:
 """
 
 import os
+from PyInstaller.utils.hooks import collect_all, collect_submodules
+
+# Collect ALL numpy files (binaries, data, submodules) to avoid missing DLL errors
+numpy_datas, numpy_binaries, numpy_hiddenimports = collect_all('numpy')
+pandas_datas, pandas_binaries, pandas_hiddenimports = collect_all('pandas')
+mt5_datas, mt5_binaries, mt5_hiddenimports = collect_all('MetaTrader5')
 
 a = Analysis(
     ['scripts/webhook_app.py'],
     pathex=['.'],
-    binaries=[],
+    binaries=numpy_binaries + pandas_binaries + mt5_binaries,
     datas=[
         # Web UI (sits next to webhook_app.py at runtime)
         ('scripts/v4_ui.html', 'scripts'),
@@ -20,7 +26,7 @@ a = Analysis(
         ('app', 'app'),
         # App icon (PNG for Qt window icon at runtime)
         ('assets/velocity4.png', 'assets'),
-    ],
+    ] + numpy_datas + pandas_datas + mt5_datas,
     hiddenimports=[
         # PySide6 Web Engine
         'PySide6.QtCore',
@@ -31,12 +37,36 @@ a = Analysis(
         'PySide6.QtWebChannel',
         # MetaTrader5
         'MetaTrader5',
-        # Data / Numeric
+        # Data / Numeric — collected via collect_all above
         'numpy',
         'numpy._core',
         'numpy._core._methods',
         'numpy._core._dtype_ctypes',
+        'numpy._core.multiarray',
+        'numpy._core.umath',
+        'numpy._core._multiarray_umath',
+        'numpy.core',
+        'numpy.core._methods',
+        'numpy.core._dtype_ctypes',
+        'numpy.core.multiarray',
+        'numpy.core.umath',
+        'numpy.core._multiarray_umath',
+        'numpy.random',
+        'numpy.random._generator',
+        'numpy.random._bounded_integers',
+        'numpy.random._common',
+        'numpy.random._mt19937',
+        'numpy.random._pcg64',
+        'numpy.random._philox',
+        'numpy.random._sfc64',
+        'numpy.random.bit_generator',
+        'numpy.random.mtrand',
+        'numpy.linalg',
+        'numpy.linalg._umath_linalg',
+        'numpy.fft',
         'pandas',
+        'pandas._libs',
+        'pandas._libs.tslibs',
         # Standard lib commonly missed
         'json',
         'logging',
@@ -44,7 +74,7 @@ a = Analysis(
         'math',
         'pathlib',
         'concurrent.futures',
-    ],
+    ] + numpy_hiddenimports + pandas_hiddenimports + mt5_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
